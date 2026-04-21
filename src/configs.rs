@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub bitcoin_rpc_url: String,
     pub bitcoin_rpc_user: String,
     pub bitcoin_rpc_password: String,
+    #[serde(default = "default_bitcoin_rpc_timeout_secs")]
     pub bitcoin_rpc_timeout_secs: u64,
     pub evm_rpc_url: String,
     pub relay_contract_address: String,
@@ -56,3 +57,8 @@ impl AppConfig {
         Ok(())
     }
 }
+
+fn default_bitcoin_rpc_timeout_secs() -> u64 {
+    10
+}
+

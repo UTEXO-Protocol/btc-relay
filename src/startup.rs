@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 use reqwest::blocking::Client;
+use std::time::Duration;
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
 use crate::configs::AppConfig;
@@ -27,6 +28,7 @@ pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
 
 pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
     let http = Client::builder()
+        .timeout(Duration::from_secs(cfg.bitcoin_rpc_timeout_secs))
         .build()
         .context("failed to build HTTP client for bitcoin rpc")?;
 
