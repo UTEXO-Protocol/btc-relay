@@ -9,6 +9,9 @@ pub struct AppConfig {
     pub bitcoin_rpc_password: String,
     #[serde(default = "default_bitcoin_rpc_timeout_secs")]
     pub bitcoin_rpc_timeout_secs: u64,
+    /// Seconds between polls while bitcoind is in IBD (initial block download).
+    #[serde(default = "default_bitcoin_ibd_poll_secs")]
+    pub bitcoin_ibd_poll_secs: u64,
     pub evm_rpc_url: String,
     pub relay_contract_address: String,
     pub relayer_private_key: String,
@@ -41,6 +44,9 @@ impl AppConfig {
         if self.bitcoin_rpc_timeout_secs <= 0 {
             anyhow::bail!("BITCOIN_RPC_TIMEOUT_SECS must be > 0");
         }
+        if self.bitcoin_ibd_poll_secs == 0 {
+            anyhow::bail!("BITCOIN_IBD_POLL_SECS must be > 0");
+        }
         if !self.evm_rpc_url.starts_with("http") {
             anyhow::bail!("EVM_RPC_URL must start with http/https");
         }
@@ -62,3 +68,6 @@ fn default_bitcoin_rpc_timeout_secs() -> u64 {
     10
 }
 
+fn default_bitcoin_ibd_poll_secs() -> u64 {
+    30
+}

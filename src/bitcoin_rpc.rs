@@ -51,6 +51,21 @@ impl HttpBitcoinRpcClient {
 
         Ok(body["result"].clone())
     }
+
+    /// Returns `true` while bitcoind is in initial block download (IBD).
+    /// Uses `getblockchaininfo` → `initialblockdownload` (Bitcoin Core).
+    pub fn initial_block_download(&self) -> Result<bool> {
+        let result = self
+            .rpc_call("getblockchaininfo", json!([]))
+            .context("getblockchaininfo rpc call failed")?;
+
+        let ibd = result
+            .get("initialblockdownload")
+            .and_then(|v| v.as_bool())
+            .context("getblockchaininfo result missing initialblockdownload")?;
+
+        Ok(ibd)
+    }
 }
 
 fn build_rpc_payload(method: &str, params: Value) -> Value {
@@ -172,6 +187,20 @@ mod tests {
         assert_eq!(payload["id"], "btc-relayer");
         assert_eq!(payload["method"], "getblockhash");
         assert_eq!(payload["params"], json!([42]));
+    }
+
+    #[test]
+    fn initial_block_download_reads_flag_from_blockchain_info() {
+        let url = spawn_test_server(
+            r#"{"result":{"chain":"regtest","blocks":1,"initialblockdownload":false},"error":null,"id":"btc-relayer"}"#,
+        );
+        let client = HttpBitcoinRpcClient::new(
+            url,
+            "user".to_string(),
+            "pass".to_string(),
+            Client::builder().build().expect("client"),
+        );
+        assert!(!client.initial_block_download().expect("ibd"));
     }
 
     #[test]

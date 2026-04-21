@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 use reqwest::blocking::Client;
+use std::thread;
 use std::time::Duration;
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
@@ -26,6 +27,33 @@ pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Blocks until bitcoind reports `initialblockdownload == false`, matching atomiq-relay
+/// `waitForBitcoinRpc` behavior (poll while IBD or RPC errors).
+pub fn wait_for_bitcoin_ibd_complete(rpc: &HttpBitcoinRpcClient, poll_secs: u64) {
+    loop {
+        match rpc.initial_block_download() {
+            Ok(false) => {
+                info!("bitcoin RPC ready: initial block download (IBD) finished");
+                return;
+            }
+            Ok(true) => {
+                info!(
+                    "bitcoin node is still in initial block download (IBD); retrying in {}s",
+                    poll_secs
+                );
+                thread::sleep(Duration::from_secs(poll_secs));
+            }
+            Err(e) => {
+                warn!(
+                    "bitcoin RPC not ready during IBD check ({}); retrying in {}s",
+                    e, poll_secs
+                );
+                thread::sleep(Duration::from_secs(poll_secs));
+            }
+        }
+    }
+}
+
 pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
     let http = Client::builder()
         .timeout(Duration::from_secs(cfg.bitcoin_rpc_timeout_secs))
@@ -38,6 +66,8 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
         cfg.bitcoin_rpc_password.clone(),
         http,
     );
+
+    wait_for_bitcoin_ibd_complete(&rpc, cfg.bitcoin_ibd_poll_secs);
 
     let tip_height = rpc
         .get_block_count()
