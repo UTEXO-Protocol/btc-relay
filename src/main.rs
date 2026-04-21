@@ -22,6 +22,7 @@ fn main() -> Result<()> {
 
     let cfg = AppConfig::load()?;
     startup::run_startup_checks(&cfg)?;
+    startup::run_bitcoin_rpc_smoke_check(&cfg)?;
 
     info!("MVP skeleton ready: config, env loading, and startup checks are working");
 

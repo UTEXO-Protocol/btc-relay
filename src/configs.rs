@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use config::{Config, Environment};
-use smart_default::SmartDefault;
 
-#[derive(Debug, Clone, Deserialize, SmartDefault)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub bitcoin_rpc_url: String,
     pub bitcoin_rpc_user: String,
     pub bitcoin_rpc_password: String,
-    #[default = 10]
     pub bitcoin_rpc_timeout_secs: u64,
     pub evm_rpc_url: String,
     pub relay_contract_address: String,
