@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 
 use crate::interfaces::BitcoinRpcClient;
 
+const BTC_HEADER_HEX_LEN: usize = 160;
+
 #[allow(dead_code)]
 pub struct HttpBitcoinRpcClient {
     pub url: String,
@@ -117,6 +119,14 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
 
         if header_hex.trim().is_empty() {
             anyhow::bail!("getblockheader returned empty header for hash {}", hash);
+        }
+        if header_hex.len() != BTC_HEADER_HEX_LEN {
+            anyhow::bail!(
+                "getblockheader returned invalid header length for hash {}: expected {}, got {}",
+                hash,
+                BTC_HEADER_HEX_LEN,
+                header_hex.len()
+            );
         }
 
         Ok(header_hex)

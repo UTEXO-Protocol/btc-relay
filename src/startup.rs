@@ -37,9 +37,20 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
         http,
     );
 
-    let tip_height = rpc.get_block_count()?;
-    let best_hash = rpc.get_best_block_hash()?;
-    let header_hex = rpc.get_block_header_hex(&best_hash)?;
+    let tip_height = rpc
+        .get_block_count()
+        .context("bitcoin rpc smoke check failed at get_block_count (check node URL/auth)")?;
+    let best_hash = rpc
+        .get_best_block_hash()
+        .context("bitcoin rpc smoke check failed at get_best_block_hash")?;
+    let header_hex = rpc
+        .get_block_header_hex(&best_hash)
+        .with_context(|| {
+            format!(
+                "bitcoin rpc smoke check failed at get_block_header_hex for best hash {}",
+                best_hash
+            )
+        })?;
 
     info!(
         "bitcoin rpc smoke check passed: tip_height={}, best_hash={}, header_hex_len={}",
