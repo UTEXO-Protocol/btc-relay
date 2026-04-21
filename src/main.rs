@@ -1,11 +1,12 @@
-mod config;
+mod bitcoin_rpc;
 mod interfaces;
 mod sync_engine;
 mod startup;
+mod configs;
 
 use anyhow::Result;
 use env_logger::{Builder, Env};
-use config::AppConfig;
+use configs::AppConfig;
 use log::info;
 
 fn init_logging() {

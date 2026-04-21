@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use config::{Config, Environment};
-#[derive(Debug, Clone, Deserialize)]
+use smart_default::SmartDefault;
+
+#[derive(Debug, Clone, Deserialize, SmartDefault)]
 pub struct AppConfig {
     pub bitcoin_rpc_url: String,
     pub bitcoin_rpc_user: String,
     pub bitcoin_rpc_password: String,
+    #[default = 10]
+    pub bitcoin_rpc_timeout_secs: u64,
     pub evm_rpc_url: String,
     pub relay_contract_address: String,
     pub relayer_private_key: String,
@@ -35,6 +39,9 @@ impl AppConfig {
         if self.bitcoin_rpc_password.trim().is_empty() {
             anyhow::bail!("BITCOIN_RPC_PASSWORD is required");
         }
+        if self.bitcoin_rpc_timeout_secs <= 0 {
+            anyhow::bail!("BITCOIN_RPC_TIMEOUT_SECS must be > 0");
+        }
         if !self.evm_rpc_url.starts_with("http") {
             anyhow::bail!("EVM_RPC_URL must start with http/https");
         }
@@ -44,7 +51,7 @@ impl AppConfig {
         if self.relayer_private_key.trim().is_empty() {
             anyhow::bail!("RELAYER_PRIVATE_KEY is required");
         }
-        if self.poll_interval_secs == 0 {
+        if self.poll_interval_secs <= 0 {
             anyhow::bail!("POLL_INTERVAL_SECS must be > 0");
         }
 

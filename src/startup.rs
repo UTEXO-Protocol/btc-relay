@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{info, warn};
 
-use crate::config::AppConfig;
+use crate::configs::AppConfig;
 
 pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
     cfg.validate()?;
