@@ -4,6 +4,7 @@ use crate::configs::AppConfig;
 use crate::interfaces::BtcRelaySubmitter;
 
 const BTC_HEADER_HEX_LEN: usize = 160;
+const EVM_TX_HASH_HEX_LEN: usize = 66;
 
 /// Task 3 scaffolding for EVM BTC relay submitter.
 ///
@@ -72,14 +73,47 @@ impl EvmBtcRelaySubmitter {
     }
 
     /// Helper stub for point 3 internal structure.
-    fn send_tx(&self, _calldata: &[u8]) -> Result<String> {
-        anyhow::bail!("not implemented yet; covered in Task 3 point 5 (ABI integration)")
+    fn send_tx(&self, calldata: &[u8]) -> Result<String> {
+        if calldata.is_empty() {
+            anyhow::bail!("cannot send header submission tx with empty calldata");
+        }
+        if self.evm_chain_id == 0 {
+            anyhow::bail!("cannot send tx: EVM chain id must be > 0");
+        }
+        if self.evm_tx_timeout_secs == 0 {
+            anyhow::bail!("cannot send tx: EVM tx timeout must be > 0");
+        }
+
+        anyhow::bail!(
+            "send_tx is preflight-ready but ABI call path is not wired yet; implement in Task 3 point 5"
+        )
     }
 
     /// Helper stub for point 3 internal structure.
-    fn wait_for_confirmation(&self, _tx_hash: &str) -> Result<()> {
-        anyhow::bail!("not implemented yet; covered in Task 3 point 5/6")
+    fn wait_for_confirmation(&self, tx_hash: &str) -> Result<()> {
+        if !is_valid_tx_hash(tx_hash) {
+            anyhow::bail!(
+                "invalid tx hash format: expected 0x-prefixed 32-byte hash ({} chars)",
+                EVM_TX_HASH_HEX_LEN
+            );
+        }
+        if self.evm_tx_confirmations == 0 {
+            anyhow::bail!("cannot wait for confirmation: EVM_TX_CONFIRMATIONS must be > 0");
+        }
+        if self.evm_tx_timeout_secs == 0 {
+            anyhow::bail!("cannot wait for confirmation: EVM_TX_TIMEOUT_SECS must be > 0");
+        }
+
+        anyhow::bail!(
+            "wait_for_confirmation preflight is ready but receipt polling is not wired yet; implement in Task 3 point 5/6"
+        )
     }
+}
+
+fn is_valid_tx_hash(value: &str) -> bool {
+    value.len() == EVM_TX_HASH_HEX_LEN
+        && value.starts_with("0x")
+        && value.chars().skip(2).all(|c| c.is_ascii_hexdigit())
 }
 
 impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
