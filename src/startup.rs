@@ -5,8 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
+use crate::btc_relay_client::EvmBtcRelaySubmitter;
 use crate::configs::AppConfig;
-use crate::interfaces::BitcoinRpcClient;
+use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
 
 pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
     cfg.validate()?;
@@ -89,6 +90,25 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
         tip_height,
         best_hash,
         header_hex.len()
+    );
+
+    Ok(())
+}
+
+pub fn run_evm_relay_read_check(cfg: &AppConfig) -> Result<()> {
+    let submitter = EvmBtcRelaySubmitter::from_config(cfg);
+
+    let tip_height = submitter
+        .relay_tip_height()
+        .context("evm relay read check failed at relay_tip_height")?;
+    let tip_commit_hash = submitter
+        .relay_commit_hash(tip_height)
+        .with_context(|| format!("evm relay read check failed at relay_commit_hash({})", tip_height))?;
+
+    info!(
+        "evm relay read check passed: tip_height={}, tip_commit_hash={}",
+        tip_height,
+        tip_commit_hash
     );
 
     Ok(())
