@@ -1,7 +1,9 @@
 use alloy::primitives::U256;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -16,6 +18,9 @@ sol! {
     interface IBtcRelayView {
         function getBlockheight() external view returns (uint32);
         function getCommitHash(uint256 height) external view returns (bytes32);
+        function submitMainBlockheaders(bytes headers) external;
+        function submitShortForkBlockheaders(bytes headers) external;
+        function submitForkBlockheaders(uint256 forkId, bytes headers) external;
     }
 }
 
@@ -63,15 +68,6 @@ impl EvmBtcRelaySubmitter {
             );
         }
 
-        fn hex_nibble(c: u8) -> Option<u8> {
-            match c {
-                b'0'..=b'9' => Some(c - b'0'),
-                b'a'..=b'f' => Some(c - b'a' + 10),
-                b'A'..=b'F' => Some(c - b'A' + 10),
-                _ => None,
-            }
-        }
-
         let mut out = Vec::with_capacity(BTC_HEADER_HEX_LEN / 2);
         let bytes = header_hex.as_bytes();
         let mut i = 0;
@@ -97,9 +93,41 @@ impl EvmBtcRelaySubmitter {
             anyhow::bail!("cannot send tx: EVM tx timeout must be > 0");
         }
 
-        anyhow::bail!(
-            "send_tx is preflight-ready but ABI call path is not wired yet; implement in Task 3 point 5"
-        )
+        let accounts = self
+            .rpc_request("eth_accounts", json!([]))
+            .context("failed to fetch sender account via eth_accounts")?;
+        let from = accounts
+            .as_array()
+            .and_then(|v| v.first())
+            .and_then(|v| v.as_str())
+            .context("eth_accounts returned no available unlocked accounts")?;
+
+        let mut tx_obj = json!({
+            "from": from,
+            "to": self.relay_contract_address,
+            "data": bytes_to_prefixed_hex(calldata),
+            "chainId": to_hex_quantity_u64(self.evm_chain_id),
+        });
+        if let Some(max_fee) = self.evm_max_fee_gwei {
+            tx_obj["maxFeePerGas"] = Value::String(to_hex_quantity_u64(max_fee * 1_000_000_000));
+        }
+        if let Some(priority_fee) = self.evm_priority_fee_gwei {
+            tx_obj["maxPriorityFeePerGas"] =
+                Value::String(to_hex_quantity_u64(priority_fee * 1_000_000_000));
+        }
+
+        let tx_hash = self
+            .rpc_request("eth_sendTransaction", json!([tx_obj]))
+            .context("eth_sendTransaction failed")?
+            .as_str()
+            .context("eth_sendTransaction returned non-string tx hash")?
+            .to_string();
+
+        if !is_valid_tx_hash(&tx_hash) {
+            anyhow::bail!("eth_sendTransaction returned invalid tx hash: {}", tx_hash);
+        }
+
+        Ok(tx_hash)
     }
 
     /// Helper stub for point 3 internal structure.
@@ -117,49 +145,151 @@ impl EvmBtcRelaySubmitter {
             anyhow::bail!("cannot wait for confirmation: EVM_TX_TIMEOUT_SECS must be > 0");
         }
 
-        anyhow::bail!(
-            "wait_for_confirmation preflight is ready but receipt polling is not wired yet; implement in Task 3 point 5/6"
-        )
+        #[derive(Debug, Deserialize)]
+        struct Receipt {
+            status: Option<String>,
+            #[serde(rename = "blockNumber")]
+            block_number: Option<String>,
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(self.evm_tx_timeout_secs);
+        let poll_interval = Duration::from_secs(2);
+
+        loop {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for tx confirmation after {}s (tx: {})",
+                    self.evm_tx_timeout_secs,
+                    tx_hash
+                );
+            }
+
+            let receipt_value = self
+                .rpc_request("eth_getTransactionReceipt", json!([tx_hash]))
+                .with_context(|| format!("failed eth_getTransactionReceipt for {}", tx_hash))?;
+
+            if receipt_value.is_null() {
+                thread::sleep(poll_interval);
+                continue;
+            }
+
+            let receipt: Receipt = serde_json::from_value(receipt_value)
+                .context("failed to decode eth_getTransactionReceipt result")?;
+
+            match receipt.status.as_deref() {
+                Some("0x1") => {}
+                Some("0x0") => anyhow::bail!("transaction reverted on-chain: {}", tx_hash),
+                Some(other) => anyhow::bail!("unexpected transaction status {} for {}", other, tx_hash),
+                None => anyhow::bail!("transaction receipt missing status for {}", tx_hash),
+            }
+
+            let tx_block = receipt
+                .block_number
+                .as_deref()
+                .context("transaction receipt missing blockNumber")?;
+            let tx_block_num =
+                parse_hex_quantity_u64(tx_block).context("invalid tx receipt blockNumber format")?;
+
+            let head = self
+                .rpc_request("eth_blockNumber", json!([]))
+                .context("failed to fetch eth_blockNumber")?
+                .as_str()
+                .context("eth_blockNumber returned non-string result")?
+                .to_string();
+            
+            let head_num =
+                parse_hex_quantity_u64(head.as_str()).context("invalid eth_blockNumber format")?;
+
+            let confirmations = head_num.saturating_sub(tx_block_num) + 1;
+            if confirmations >= self.evm_tx_confirmations {
+                return Ok(());
+            }
+
+            thread::sleep(poll_interval);
+        }
+    }
+
+    /// MVP submit path: send canonical/main-chain headers only.
+    /// Fork-specific submit methods are intentionally left for next iteration.
+    fn build_submit_main_calldata(&self, headers_bytes: &[u8]) -> Vec<u8> {
+        let owned_headers: Vec<u8> = headers_bytes.to_vec();
+        let call = IBtcRelayView::submitMainBlockheadersCall {
+            headers: owned_headers.into(),
+        };
+        call.abi_encode()
+    }
+
+    /// Next iteration hook: short competing fork support.
+    #[allow(dead_code)]
+    fn build_submit_short_fork_calldata(&self, headers_bytes: &[u8]) -> Vec<u8> {
+        let owned_headers: Vec<u8> = headers_bytes.to_vec();
+        let call = IBtcRelayView::submitShortForkBlockheadersCall {
+            headers: owned_headers.into(),
+        };
+        call.abi_encode()
+    }
+
+    /// Next iteration hook: append headers to an existing fork.
+    #[allow(dead_code)]
+    fn build_submit_fork_calldata(&self, fork_id: u64, headers_bytes: &[u8]) -> Vec<u8> {
+        let owned_headers: Vec<u8> = headers_bytes.to_vec();
+        let call = IBtcRelayView::submitForkBlockheadersCall {
+            forkId: U256::try_from(fork_id).unwrap(),
+            headers: owned_headers.into(),
+        };
+        call.abi_encode()
     }
 
     /// Minimal `eth_call` helper used for ABI read calls.
     fn evm_call_latest(&self, to: &str, data: &[u8]) -> Result<Vec<u8>> {
+        let result = self
+            .rpc_request(
+                "eth_call",
+                json!([
+                    {
+                        "to": to,
+                        "data": bytes_to_prefixed_hex(data),
+                    },
+                    "latest"
+                ]),
+            )
+            .context("eth_call failed")?
+            .as_str()
+            .context("eth_call returned non-string result")?
+            .to_string();
+
+        hex_prefixed_to_bytes(&result).context("eth_call returned invalid hex result")
+    }
+
+    fn rpc_request(&self, method: &str, params: Value) -> Result<Value> {
         #[derive(Debug, Deserialize)]
-        struct EthCallResponse {
-            result: Option<String>,
-            error: Option<serde_json::Value>,
+        struct JsonRpcResponse {
+            result: Option<Value>,
+            error: Option<Value>,
         }
 
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": to,
-                    "data": bytes_to_prefixed_hex(data),
-                },
-                "latest"
-            ],
+            "method": method,
+            "params": params,
         });
 
-        let response: EthCallResponse = reqwest::blocking::Client::new()
+        let response: JsonRpcResponse = reqwest::blocking::Client::new()
             .post(&self.evm_rpc_url)
             .json(&request)
             .send()
-            .context("eth_call transport failed")?
+            .with_context(|| format!("{} transport failed", method))?
             .json()
-            .context("eth_call response decode failed")?;
+            .with_context(|| format!("{} response decode failed", method))?;
 
         if let Some(err) = response.error {
-            anyhow::bail!("eth_call returned error: {}", err);
+            anyhow::bail!("{} returned error: {}", method, err);
         }
 
-        let result = response
+        response
             .result
-            .context("eth_call response missing result field")?;
-
-        hex_prefixed_to_bytes(&result).context("eth_call returned invalid hex result")
+            .with_context(|| format!("{} response missing result field", method))
     }
 }
 
@@ -200,9 +330,10 @@ impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
         let header_bytes = self
             .header_hex_to_bytes(header_hex)
             .context("failed to validate/convert header hex")?;
+        let calldata = self.build_submit_main_calldata(&header_bytes);
 
         let tx_hash = self
-            .send_tx(&header_bytes)
+            .send_tx(&calldata)
             .context("failed to send header submission transaction")?;
 
         self.wait_for_confirmation(&tx_hash)
@@ -222,6 +353,29 @@ fn bytes_to_prefixed_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn to_hex_quantity_u64(value: u64) -> String {
+    format!("0x{:x}", value)
+}
+
+fn parse_hex_quantity_u64(value: &str) -> Result<u64> {
+    let raw = value
+        .strip_prefix("0x")
+        .context("hex quantity must start with 0x")?;
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(raw, 16).context("failed to parse hex quantity as u64")
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn hex_prefixed_to_bytes(value: &str) -> Result<Vec<u8>> {
     if !value.starts_with("0x") {
         anyhow::bail!("hex value must start with 0x");
@@ -229,15 +383,6 @@ fn hex_prefixed_to_bytes(value: &str) -> Result<Vec<u8>> {
     let s = &value[2..];
     if s.len() % 2 != 0 {
         anyhow::bail!("hex value must have even length");
-    }
-
-    fn hex_nibble(c: u8) -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
     }
 
     let mut out = Vec::with_capacity(s.len() / 2);
