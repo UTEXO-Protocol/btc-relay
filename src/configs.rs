@@ -15,6 +15,14 @@ pub struct AppConfig {
     pub evm_rpc_url: String,
     pub relay_contract_address: String,
     pub relayer_private_key: String,
+    #[serde(default = "default_evm_chain_id")]
+    pub evm_chain_id: u64,
+    #[serde(default = "default_evm_tx_confirmations")]
+    pub evm_tx_confirmations: u64,
+    #[serde(default = "default_evm_tx_timeout_secs")]
+    pub evm_tx_timeout_secs: u64,
+    pub evm_max_fee_gwei: Option<u64>,
+    pub evm_priority_fee_gwei: Option<u64>,
     pub poll_interval_secs: u64,
     pub start_height: u64,
 }
@@ -53,8 +61,20 @@ impl AppConfig {
         if self.relay_contract_address.trim().is_empty() {
             anyhow::bail!("RELAY_CONTRACT_ADDRESS is required");
         }
+        if !is_valid_evm_address(&self.relay_contract_address) {
+            anyhow::bail!("RELAY_CONTRACT_ADDRESS must be a valid 0x-prefixed 20-byte hex address");
+        }
         if self.relayer_private_key.trim().is_empty() {
             anyhow::bail!("RELAYER_PRIVATE_KEY is required");
+        }
+        if self.evm_chain_id == 0 {
+            anyhow::bail!("EVM_CHAIN_ID must be > 0");
+        }
+        if self.evm_tx_confirmations == 0 {
+            anyhow::bail!("EVM_TX_CONFIRMATIONS must be > 0");
+        }
+        if self.evm_tx_timeout_secs == 0 {
+            anyhow::bail!("EVM_TX_TIMEOUT_SECS must be > 0");
         }
         if self.poll_interval_secs <= 0 {
             anyhow::bail!("POLL_INTERVAL_SECS must be > 0");
@@ -70,4 +90,22 @@ fn default_bitcoin_rpc_timeout_secs() -> u64 {
 
 fn default_bitcoin_ibd_poll_secs() -> u64 {
     30
+}
+
+fn default_evm_chain_id() -> u64 {
+    31337
+}
+
+fn default_evm_tx_confirmations() -> u64 {
+    1
+}
+
+fn default_evm_tx_timeout_secs() -> u64 {
+    120
+}
+
+fn is_valid_evm_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value.chars().skip(2).all(|c| c.is_ascii_hexdigit())
 }
