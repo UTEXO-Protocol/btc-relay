@@ -1,4 +1,5 @@
 mod bitcoin_rpc;
+mod btc_relay_client;
 mod interfaces;
 mod sync_engine;
 mod startup;
