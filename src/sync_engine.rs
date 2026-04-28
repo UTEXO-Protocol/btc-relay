@@ -144,7 +144,15 @@ fn run_poll_cycle(
         return Ok(SyncResult::UpToDate);
     }
 
-    let (from_height, to_height) = compute_catchup_range(relay_tip, bitcoin_tip, loop_state.start_height)
+    let persisted_state = state_store
+        .load()
+        .context("failed to load persisted relay state in poll cycle")?;
+    let resume_start_height = resolve_resume_start_height(
+        relay_tip,
+        loop_state.start_height,
+        persisted_state.as_ref(),
+    );
+    let (from_height, to_height) = compute_catchup_range(relay_tip, bitcoin_tip, resume_start_height)
         .context("failed to calculate catch-up range")?;
 
     loop_state.state = SyncEngineState::CatchingUp;
@@ -302,11 +310,47 @@ fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) ->
     Ok((from_height, bitcoin_tip))
 }
 
+fn resolve_resume_start_height(
+    relay_tip: u64,
+    configured_start_height: u64,
+    persisted_state: Option<&RelayProgressState>,
+) -> u64 {
+    let next_from_relay = relay_tip.saturating_add(1);
+    if let Some(state) = persisted_state {
+        if state.last_submitted_height < relay_tip {
+            warn!(
+                "persisted state is behind relay tip (persisted_height={}, relay_tip={}); resuming from relay tip + 1",
+                state.last_submitted_height, relay_tip
+            );
+        } else if state.last_submitted_height > relay_tip {
+            warn!(
+                "persisted state is ahead of relay tip (persisted_height={}, relay_tip={}); relay tip remains source of truth",
+                state.last_submitted_height, relay_tip
+            );
+        }
+        if configured_start_height > 0 {
+            info!(
+                "ignoring START_HEIGHT={} because persisted state exists; resuming from relay tip + 1",
+                configured_start_height
+            );
+        }
+        return next_from_relay;
+    }
+
+    if configured_start_height > 0 {
+        return configured_start_height.max(next_from_relay);
+    }
+    next_from_relay
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_retry_decision, compute_catchup_range, process_catchup_range, RetryDecision};
+    use super::{
+        classify_retry_decision, compute_catchup_range, process_catchup_range,
+        resolve_resume_start_height, RetryDecision,
+    };
     use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
-    use crate::persistence::JsonFileStateStore;
+    use crate::persistence::{JsonFileStateStore, RelayProgressState};
     use anyhow::Result;
     use std::cell::RefCell;
     use std::env;
@@ -333,6 +377,26 @@ mod tests {
     fn catchup_range_rejects_up_to_date_or_ahead_relay() {
         let err = compute_catchup_range(120, 120, 0).expect_err("expected error");
         assert!(err.to_string().contains("up to date or ahead"));
+    }
+
+    #[test]
+    fn resume_start_uses_configured_start_when_no_persisted_state() {
+        let start = resolve_resume_start_height(100, 110, None);
+        assert_eq!(start, 110);
+    }
+
+    #[test]
+    fn resume_start_uses_relay_tip_when_persisted_state_exists() {
+        let state = RelayProgressState::new(99, "hash".to_string());
+        let start = resolve_resume_start_height(100, 150, Some(&state));
+        assert_eq!(start, 101);
+    }
+
+    #[test]
+    fn resume_start_uses_relay_tip_when_persisted_ahead() {
+        let state = RelayProgressState::new(250, "hash".to_string());
+        let start = resolve_resume_start_height(100, 0, Some(&state));
+        assert_eq!(start, 101);
     }
 
     struct FakeBitcoinRpc {
