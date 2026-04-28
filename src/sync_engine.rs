@@ -46,6 +46,12 @@ enum RetryDecision {
     HardFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncProgress {
+    submitted: u64,
+    retries: u64,
+}
+
 /// Runtime state carried by the sync orchestrator loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncLoopState {
@@ -129,12 +135,13 @@ fn run_poll_cycle(
         .context("failed to calculate catch-up range")?;
 
     loop_state.state = SyncEngineState::CatchingUp;
-    let submitted = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state)?;
+    let progress = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state)?;
     info!(
-        "relay behind bitcoin tip: synced range {}..={}, submitted_headers={}, lag={}",
+        "relay behind bitcoin tip: synced range {}..={}, submitted_headers={}, retries={}, lag={}",
         from_height,
         to_height,
-        submitted,
+        progress.submitted,
+        progress.retries,
         lag
     );
     Ok(SyncResult::Progressed)
@@ -146,8 +153,9 @@ fn process_catchup_range(
     from_height: u64,
     to_height: u64,
     loop_state: &mut SyncLoopState,
-) -> Result<u64> {
+) -> Result<SyncProgress> {
     let mut submitted = 0_u64;
+    let mut retries = 0_u64;
     let total = to_height.saturating_sub(from_height).saturating_add(1);
 
     for height in from_height..=to_height {
@@ -170,6 +178,7 @@ fn process_catchup_range(
                         RetryDecision::Retryable => {
                             let delay_secs = backoff_delay_secs(attempt);
                             loop_state.state = SyncEngineState::RetryBackoff;
+                            retries = retries.saturating_add(1);
                             warn!(
                                 "temporary sync failure at height={}, attempt={}, retry_in={}s, reason={}",
                                 height, attempt, delay_secs, message
@@ -192,7 +201,7 @@ fn process_catchup_range(
         }
     }
 
-    Ok(submitted)
+    Ok(SyncProgress { submitted, retries })
 }
 
 fn process_single_height(
@@ -392,9 +401,10 @@ mod tests {
         let submitter = FakeSubmitter::new();
 
         let mut loop_state = super::SyncLoopState::new(0);
-        let submitted = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state)
+        let progress = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state)
             .expect("pipeline");
-        assert_eq!(submitted, 3);
+        assert_eq!(progress.submitted, 3);
+        assert_eq!(progress.retries, 0);
         assert_eq!(loop_state.state, super::SyncEngineState::WaitingConfirmations);
         assert_eq!(bitcoin.hash_calls.borrow().as_slice(), &[3, 4, 5]);
         assert_eq!(
@@ -417,10 +427,11 @@ mod tests {
         let submitter = FakeSubmitter::with_one_temporary_failure("header-for-hash-3");
         let mut loop_state = super::SyncLoopState::new(0);
 
-        let submitted = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state)
+        let progress = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state)
             .expect("pipeline with retry");
 
-        assert_eq!(submitted, 2);
+        assert_eq!(progress.submitted, 2);
+        assert_eq!(progress.retries, 1);
         assert_eq!(
             submitter.submitted_headers.borrow().as_slice(),
             &["header-for-hash-3".to_string(), "header-for-hash-4".to_string()]
