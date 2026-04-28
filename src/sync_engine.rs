@@ -374,6 +374,14 @@ mod tests {
         assert_eq!(start, 101);
     }
 
+    #[test]
+    fn downtime_resume_catches_up_from_persisted_state_with_relay_tip_source_of_truth() {
+        let state = RelayProgressState::new(150, "persisted-hash".to_string());
+        let resume_start = resolve_resume_start_height(150, 0, Some(&state));
+        let (from, to) = compute_catchup_range(150, 153, resume_start).expect("catch-up range");
+        assert_eq!((from, to), (151, 153));
+    }
+
     struct FakeBitcoinRpc {
         hash_calls: RefCell<Vec<u64>>,
         header_calls: RefCell<Vec<String>>,
