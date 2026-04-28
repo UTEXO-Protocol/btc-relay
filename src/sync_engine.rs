@@ -123,13 +123,58 @@ fn run_poll_cycle(
         .context("failed to calculate catch-up range")?;
 
     loop_state.state = SyncEngineState::CatchingUp;
+    let submitted = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state)?;
     info!(
-        "relay behind bitcoin tip: syncing range {}..={}, lag={}",
+        "relay behind bitcoin tip: synced range {}..={}, submitted_headers={}, lag={}",
         from_height,
         to_height,
+        submitted,
         lag
     );
     Ok(SyncResult::Progressed)
+}
+
+fn process_catchup_range(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    from_height: u64,
+    to_height: u64,
+    loop_state: &mut SyncLoopState,
+) -> Result<u64> {
+    let mut submitted = 0_u64;
+
+    for height in from_height..=to_height {
+        loop_state.state = SyncEngineState::Submitting;
+        let block_hash = bitcoin
+            .get_block_hash(height)
+            .with_context(|| format!("failed get_block_hash at height {}", height))?;
+        let header_hex = bitcoin
+            .get_block_header_hex(&block_hash)
+            .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
+
+        info!(
+            "submitting header: height={}, hash={}, header_hex_len={}",
+            height,
+            block_hash,
+            header_hex.len()
+        );
+
+        loop_state.state = SyncEngineState::WaitingConfirmations;
+        let tx_hash = submitter
+            .submit_header(&header_hex)
+            .with_context(|| format!("failed submit_header at height {}", height))?;
+
+        submitted = submitted.saturating_add(1);
+        info!(
+            "header submitted: height={}, tx_hash={}, progress={}/{}",
+            height,
+            tx_hash,
+            submitted,
+            to_height.saturating_sub(from_height).saturating_add(1)
+        );
+    }
+
+    Ok(submitted)
 }
 
 fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) -> Result<(u64, u64)> {
@@ -161,7 +206,10 @@ fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) ->
 
 #[cfg(test)]
 mod tests {
-    use super::compute_catchup_range;
+    use super::{compute_catchup_range, process_catchup_range};
+    use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+    use anyhow::Result;
+    use std::cell::RefCell;
 
     #[test]
     fn catchup_range_uses_relay_tip_plus_one_when_no_start_override() {
@@ -185,5 +233,93 @@ mod tests {
     fn catchup_range_rejects_up_to_date_or_ahead_relay() {
         let err = compute_catchup_range(120, 120, 0).expect_err("expected error");
         assert!(err.to_string().contains("up to date or ahead"));
+    }
+
+    struct FakeBitcoinRpc {
+        hash_calls: RefCell<Vec<u64>>,
+        header_calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeBitcoinRpc {
+        fn new() -> Self {
+            Self {
+                hash_calls: RefCell::new(Vec::new()),
+                header_calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BitcoinRpcClient for FakeBitcoinRpc {
+        fn get_block_count(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn get_block_hash(&self, height: u64) -> Result<String> {
+            self.hash_calls.borrow_mut().push(height);
+            Ok(format!("hash-{height}"))
+        }
+
+        fn get_best_block_hash(&self) -> Result<String> {
+            Ok("best-hash".to_string())
+        }
+
+        fn get_block_header_hex(&self, hash: &str) -> Result<String> {
+            self.header_calls.borrow_mut().push(hash.to_string());
+            Ok(format!("header-for-{hash}"))
+        }
+    }
+
+    struct FakeSubmitter {
+        submitted_headers: RefCell<Vec<String>>,
+    }
+
+    impl FakeSubmitter {
+        fn new() -> Self {
+            Self {
+                submitted_headers: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BtcRelaySubmitter for FakeSubmitter {
+        fn relay_tip_height(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+            Ok("0x00".to_string())
+        }
+
+        fn submit_header(&self, header_hex: &str) -> Result<String> {
+            self.submitted_headers
+                .borrow_mut()
+                .push(header_hex.to_string());
+            Ok(format!("0xtx{}", self.submitted_headers.borrow().len()))
+        }
+    }
+
+    #[test]
+    fn catchup_pipeline_submits_headers_in_sequential_height_order() {
+        let bitcoin = FakeBitcoinRpc::new();
+        let submitter = FakeSubmitter::new();
+
+        let mut loop_state = super::SyncLoopState::new(0);
+        let submitted = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state)
+            .expect("pipeline");
+        assert_eq!(submitted, 3);
+        assert_eq!(loop_state.state, super::SyncEngineState::WaitingConfirmations);
+        assert_eq!(bitcoin.hash_calls.borrow().as_slice(), &[3, 4, 5]);
+        assert_eq!(
+            bitcoin.header_calls.borrow().as_slice(),
+            &["hash-3".to_string(), "hash-4".to_string(), "hash-5".to_string()]
+        );
+        assert_eq!(
+            submitter.submitted_headers.borrow().as_slice(),
+            &[
+                "header-for-hash-3".to_string(),
+                "header-for-hash-4".to_string(),
+                "header-for-hash-5".to_string()
+            ]
+        );
     }
 }
