@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use std::thread;
 use std::time::Duration;
 
@@ -38,6 +38,12 @@ pub enum SyncResult {
     Progressed,
     ReorgDetected,
     TemporaryFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    Retryable,
+    HardFailure,
 }
 
 /// Runtime state carried by the sync orchestrator loop.
@@ -142,39 +148,103 @@ fn process_catchup_range(
     loop_state: &mut SyncLoopState,
 ) -> Result<u64> {
     let mut submitted = 0_u64;
+    let total = to_height.saturating_sub(from_height).saturating_add(1);
 
     for height in from_height..=to_height {
-        loop_state.state = SyncEngineState::Submitting;
-        let block_hash = bitcoin
-            .get_block_hash(height)
-            .with_context(|| format!("failed get_block_hash at height {}", height))?;
-        let header_hex = bitcoin
-            .get_block_header_hex(&block_hash)
-            .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
 
-        info!(
-            "submitting header: height={}, hash={}, header_hex_len={}",
-            height,
-            block_hash,
-            header_hex.len()
-        );
-
-        loop_state.state = SyncEngineState::WaitingConfirmations;
-        let tx_hash = submitter
-            .submit_header(&header_hex)
-            .with_context(|| format!("failed submit_header at height {}", height))?;
-
-        submitted = submitted.saturating_add(1);
-        info!(
-            "header submitted: height={}, tx_hash={}, progress={}/{}",
-            height,
-            tx_hash,
-            submitted,
-            to_height.saturating_sub(from_height).saturating_add(1)
-        );
+            match process_single_height(bitcoin, submitter, height, loop_state) {
+                Ok(tx_hash) => {
+                    submitted = submitted.saturating_add(1);
+                    info!(
+                        "header submitted: height={}, tx_hash={}, progress={}/{}, attempt={}",
+                        height, tx_hash, submitted, total, attempt
+                    );
+                    break;
+                }
+                Err(err) => {
+                    let message = format!("{:#}", err);
+                    match classify_retry_decision(message.as_str()) {
+                        RetryDecision::Retryable => {
+                            let delay_secs = backoff_delay_secs(attempt);
+                            loop_state.state = SyncEngineState::RetryBackoff;
+                            warn!(
+                                "temporary sync failure at height={}, attempt={}, retry_in={}s, reason={}",
+                                height, attempt, delay_secs, message
+                            );
+                            thread::sleep(Duration::from_secs(delay_secs));
+                            continue;
+                        }
+                        RetryDecision::HardFailure => {
+                            loop_state.state = SyncEngineState::Error;
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "hard failure while processing height {} after {} attempt(s)",
+                                    height, attempt
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(submitted)
+}
+
+fn process_single_height(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    height: u64,
+    loop_state: &mut SyncLoopState,
+) -> Result<String> {
+    loop_state.state = SyncEngineState::Submitting;
+    let block_hash = bitcoin
+        .get_block_hash(height)
+        .with_context(|| format!("failed get_block_hash at height {}", height))?;
+    let header_hex = bitcoin
+        .get_block_header_hex(&block_hash)
+        .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
+
+    info!(
+        "submitting header: height={}, hash={}, header_hex_len={}",
+        height,
+        block_hash,
+        header_hex.len()
+    );
+
+    loop_state.state = SyncEngineState::WaitingConfirmations;
+    submitter
+        .submit_header(&header_hex)
+        .with_context(|| format!("failed submit_header at height {}", height))
+}
+
+fn classify_retry_decision(err_message: &str) -> RetryDecision {
+    let msg = err_message.to_ascii_lowercase();
+    let retryable_markers = [
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "transport failed",
+        "429",
+        "503",
+        "network",
+        "broken pipe",
+    ];
+    if retryable_markers.iter().any(|m| msg.contains(m)) {
+        return RetryDecision::Retryable;
+    }
+    RetryDecision::HardFailure
+}
+
+fn backoff_delay_secs(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(5);
+    1_u64 << shift
 }
 
 fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) -> Result<(u64, u64)> {
@@ -206,7 +276,7 @@ fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_catchup_range, process_catchup_range};
+    use super::{classify_retry_decision, compute_catchup_range, process_catchup_range, RetryDecision};
     use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -271,12 +341,24 @@ mod tests {
 
     struct FakeSubmitter {
         submitted_headers: RefCell<Vec<String>>,
+        fail_once_for_header: Option<String>,
+        failed_once: RefCell<bool>,
     }
 
     impl FakeSubmitter {
         fn new() -> Self {
             Self {
                 submitted_headers: RefCell::new(Vec::new()),
+                fail_once_for_header: None,
+                failed_once: RefCell::new(false),
+            }
+        }
+
+        fn with_one_temporary_failure(header: &str) -> Self {
+            Self {
+                submitted_headers: RefCell::new(Vec::new()),
+                fail_once_for_header: Some(header.to_string()),
+                failed_once: RefCell::new(false),
             }
         }
     }
@@ -291,6 +373,12 @@ mod tests {
         }
 
         fn submit_header(&self, header_hex: &str) -> Result<String> {
+            if let Some(target) = &self.fail_once_for_header {
+                if header_hex == target && !*self.failed_once.borrow() {
+                    *self.failed_once.borrow_mut() = true;
+                    anyhow::bail!("network timeout while submitting header");
+                }
+            }
             self.submitted_headers
                 .borrow_mut()
                 .push(header_hex.to_string());
@@ -320,6 +408,34 @@ mod tests {
                 "header-for-hash-4".to_string(),
                 "header-for-hash-5".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn catchup_pipeline_retries_temporary_failure_and_continues() {
+        let bitcoin = FakeBitcoinRpc::new();
+        let submitter = FakeSubmitter::with_one_temporary_failure("header-for-hash-3");
+        let mut loop_state = super::SyncLoopState::new(0);
+
+        let submitted = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state)
+            .expect("pipeline with retry");
+
+        assert_eq!(submitted, 2);
+        assert_eq!(
+            submitter.submitted_headers.borrow().as_slice(),
+            &["header-for-hash-3".to_string(), "header-for-hash-4".to_string()]
+        );
+    }
+
+    #[test]
+    fn retry_classification_distinguishes_temporary_and_hard_failures() {
+        assert_eq!(
+            classify_retry_decision("bitcoin rpc transport failed: timeout"),
+            RetryDecision::Retryable
+        );
+        assert_eq!(
+            classify_retry_decision("failed to decode abi output"),
+            RetryDecision::HardFailure
         );
     }
 }
