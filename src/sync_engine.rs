@@ -4,6 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+use crate::persistence::{JsonFileStateStore, RelayProgressState};
 
 /// High-level lifecycle for the relayer sync process.
 #[allow(dead_code)]
@@ -78,6 +79,7 @@ pub fn run_sync_loop(
     submitter: &dyn BtcRelaySubmitter,
     poll_interval_secs: u64,
     start_height: u64,
+    state_store: &JsonFileStateStore,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(poll_interval_secs.max(1));
     let mut loop_state = SyncLoopState::new(start_height);
@@ -87,6 +89,16 @@ pub fn run_sync_loop(
         poll_interval.as_secs(),
         start_height
     );
+    if let Some(state) = state_store.load().context("failed to load persisted relay state")? {
+        info!(
+            "loaded persisted relay state: last_submitted_height={}, last_submitted_hash={}, updated_at={}",
+            state.last_submitted_height,
+            state.last_submitted_hash,
+            state.updated_at_unix_secs
+        );
+    } else {
+        info!("no persisted relay state found yet");
+    }
 
     loop {
         loop_state.poll_count = loop_state.poll_count.saturating_add(1);
@@ -96,7 +108,7 @@ pub fn run_sync_loop(
             SyncTrigger::PollTick
         };
 
-        let cycle_result = run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state)?;
+        let cycle_result = run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store)?;
         info!(
             "sync poll cycle complete: poll_count={}, state={:?}, result={:?}",
             loop_state.poll_count, loop_state.state, cycle_result
@@ -111,6 +123,7 @@ fn run_poll_cycle(
     submitter: &dyn BtcRelaySubmitter,
     trigger: SyncTrigger,
     loop_state: &mut SyncLoopState,
+    state_store: &JsonFileStateStore,
 ) -> Result<SyncResult> {
     loop_state.state = SyncEngineState::Active;
 
@@ -135,7 +148,7 @@ fn run_poll_cycle(
         .context("failed to calculate catch-up range")?;
 
     loop_state.state = SyncEngineState::CatchingUp;
-    let progress = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state)?;
+    let progress = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state, state_store)?;
     info!(
         "relay behind bitcoin tip: synced range {}..={}, submitted_headers={}, retries={}, lag={}",
         from_height,
@@ -153,6 +166,7 @@ fn process_catchup_range(
     from_height: u64,
     to_height: u64,
     loop_state: &mut SyncLoopState,
+    state_store: &JsonFileStateStore,
 ) -> Result<SyncProgress> {
     let mut submitted = 0_u64;
     let mut retries = 0_u64;
@@ -164,8 +178,12 @@ fn process_catchup_range(
             attempt = attempt.saturating_add(1);
 
             match process_single_height(bitcoin, submitter, height, loop_state) {
-                Ok(tx_hash) => {
+                Ok((block_hash, tx_hash)) => {
                     submitted = submitted.saturating_add(1);
+                    let state = RelayProgressState::new(height, block_hash);
+                    state_store
+                        .save(&state)
+                        .with_context(|| format!("failed persisting relay state at height {}", height))?;
                     info!(
                         "header submitted: height={}, tx_hash={}, progress={}/{}, attempt={}",
                         height, tx_hash, submitted, total, attempt
@@ -209,7 +227,7 @@ fn process_single_height(
     submitter: &dyn BtcRelaySubmitter,
     height: u64,
     loop_state: &mut SyncLoopState,
-) -> Result<String> {
+) -> Result<(String, String)> {
     loop_state.state = SyncEngineState::Submitting;
     let block_hash = bitcoin
         .get_block_hash(height)
@@ -226,9 +244,10 @@ fn process_single_height(
     );
 
     loop_state.state = SyncEngineState::WaitingConfirmations;
-    submitter
+    let tx_hash = submitter
         .submit_header(&header_hex)
-        .with_context(|| format!("failed submit_header at height {}", height))
+        .with_context(|| format!("failed submit_header at height {}", height))?;
+    Ok((block_hash, tx_hash))
 }
 
 fn classify_retry_decision(err_message: &str) -> RetryDecision {
@@ -287,8 +306,10 @@ fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) ->
 mod tests {
     use super::{classify_retry_decision, compute_catchup_range, process_catchup_range, RetryDecision};
     use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+    use crate::persistence::JsonFileStateStore;
     use anyhow::Result;
     use std::cell::RefCell;
+    use std::env;
 
     #[test]
     fn catchup_range_uses_relay_tip_plus_one_when_no_start_override() {
@@ -399,9 +420,10 @@ mod tests {
     fn catchup_pipeline_submits_headers_in_sequential_height_order() {
         let bitcoin = FakeBitcoinRpc::new();
         let submitter = FakeSubmitter::new();
+        let state_store = test_state_store();
 
         let mut loop_state = super::SyncLoopState::new(0);
-        let progress = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state)
+        let progress = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state, &state_store)
             .expect("pipeline");
         assert_eq!(progress.submitted, 3);
         assert_eq!(progress.retries, 0);
@@ -425,9 +447,10 @@ mod tests {
     fn catchup_pipeline_retries_temporary_failure_and_continues() {
         let bitcoin = FakeBitcoinRpc::new();
         let submitter = FakeSubmitter::with_one_temporary_failure("header-for-hash-3");
+        let state_store = test_state_store();
         let mut loop_state = super::SyncLoopState::new(0);
 
-        let progress = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state)
+        let progress = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state, &state_store)
             .expect("pipeline with retry");
 
         assert_eq!(progress.submitted, 2);
@@ -448,5 +471,22 @@ mod tests {
             classify_retry_decision("failed to decode abi output"),
             RetryDecision::HardFailure
         );
+    }
+
+    fn test_state_store() -> JsonFileStateStore {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "btc-relay-sync-engine-state-{}-{}.json",
+            std::process::id(),
+            current_test_timestamp()
+        ));
+        JsonFileStateStore::new(path)
+    }
+
+    fn current_test_timestamp() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
     }
 }

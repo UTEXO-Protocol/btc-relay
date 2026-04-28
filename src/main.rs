@@ -4,6 +4,7 @@ mod interfaces;
 mod sync_engine;
 mod startup;
 mod configs;
+mod persistence;
 
 use anyhow::Result;
 use bitcoin_rpc::HttpBitcoinRpcClient;
@@ -13,6 +14,7 @@ use configs::AppConfig;
 use log::info;
 use reqwest::blocking::Client;
 use std::time::Duration;
+use persistence::JsonFileStateStore;
 
 fn init_logging() {
     let env = Env::default().default_filter_or("info");
@@ -46,12 +48,14 @@ fn main() -> Result<()> {
         bitcoin_http,
     );
     let submitter = EvmBtcRelaySubmitter::from_config(&cfg);
+    let state_store = JsonFileStateStore::new(cfg.state_file_path.clone());
 
     sync_engine::run_sync_loop(
         &bitcoin,
         &submitter,
         cfg.poll_interval_secs,
         cfg.start_height,
+        &state_store,
     )?;
 
     Ok(())
