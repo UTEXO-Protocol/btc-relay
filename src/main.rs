@@ -9,23 +9,27 @@ mod persistence;
 use anyhow::Result;
 use bitcoin_rpc::HttpBitcoinRpcClient;
 use btc_relay_client::EvmBtcRelaySubmitter;
-use env_logger::{Builder, Env};
 use configs::AppConfig;
-use log::info;
 use reqwest::blocking::Client;
 use std::time::Duration;
 use persistence::JsonFileStateStore;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-fn init_logging() {
-    let env = Env::default().default_filter_or("info");
-    Builder::from_env(env)
-        .format_target(false)
-        .init();
+fn init_logging() -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .with_level(true)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("failed to initialize tracing subscriber: {}", e))?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    init_logging();
+    init_logging()?;
 
     // 1) Load config from environment.
     let cfg = AppConfig::load()?;
@@ -36,7 +40,7 @@ fn main() -> Result<()> {
     // 4) EVM relay read-only connectivity checks.
     startup::run_evm_relay_read_check(&cfg)?;
 
-    info!("startup pipeline complete: config, bitcoin checks, and evm read checks are working");
+    info!("startup pipeline complete");
 
     let bitcoin_http = Client::builder()
         .timeout(Duration::from_secs(cfg.bitcoin_rpc_timeout_secs))

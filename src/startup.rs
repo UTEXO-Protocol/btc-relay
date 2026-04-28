@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
 use reqwest::blocking::Client;
 use std::thread;
 use std::time::Duration;
+use tracing::{info, warn};
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
 use crate::btc_relay_client::EvmBtcRelaySubmitter;
@@ -13,16 +13,16 @@ pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
     cfg.validate()?;
 
     if cfg.start_height > 0 {
-        warn!("custom start height configured: {}", cfg.start_height);
+        warn!(start_height = cfg.start_height, "custom start height configured");
     } else {
         info!("start height is 0; relayer will auto-discover from chain state in later tasks");
     }
 
     info!(
-        "startup config validated: bitcoin_rpc_url={}, evm_rpc_url={}, poll_interval_secs={}",
-        cfg.bitcoin_rpc_url,
-        cfg.evm_rpc_url,
-        cfg.poll_interval_secs
+        bitcoin_rpc_url = %cfg.bitcoin_rpc_url,
+        evm_rpc_url = %cfg.evm_rpc_url,
+        poll_interval_secs = cfg.poll_interval_secs,
+        "startup config validated"
     );
 
     Ok(())
@@ -38,17 +38,11 @@ pub fn wait_for_bitcoin_ibd_complete(rpc: &HttpBitcoinRpcClient, poll_secs: u64)
                 return;
             }
             Ok(true) => {
-                info!(
-                    "bitcoin node is still in initial block download (IBD); retrying in {}s",
-                    poll_secs
-                );
+                info!(retry_in_secs = poll_secs, "bitcoin node is still in initial block download (IBD)");
                 thread::sleep(Duration::from_secs(poll_secs));
             }
             Err(e) => {
-                warn!(
-                    "bitcoin RPC not ready during IBD check ({}); retrying in {}s",
-                    e, poll_secs
-                );
+                warn!(error = %e, retry_in_secs = poll_secs, "bitcoin RPC not ready during IBD check");
                 thread::sleep(Duration::from_secs(poll_secs));
             }
         }
@@ -85,12 +79,7 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
             )
         })?;
 
-    info!(
-        "bitcoin rpc smoke check passed: tip_height={}, best_hash={}, header_hex_len={}",
-        tip_height,
-        best_hash,
-        header_hex.len()
-    );
+    info!(tip_height, best_hash = %best_hash, header_hex_len = header_hex.len(), "bitcoin rpc smoke check passed");
 
     Ok(())
 }
@@ -105,11 +94,7 @@ pub fn run_evm_relay_read_check(cfg: &AppConfig) -> Result<()> {
         .relay_commit_hash(tip_height)
         .with_context(|| format!("evm relay read check failed at relay_commit_hash({})", tip_height))?;
 
-    info!(
-        "evm relay read check passed: tip_height={}, tip_commit_hash={}",
-        tip_height,
-        tip_commit_hash
-    );
+    info!(tip_height, tip_commit_hash = %tip_commit_hash, "evm relay read check passed");
 
     Ok(())
 }

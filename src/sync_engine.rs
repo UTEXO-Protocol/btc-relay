@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
 use std::thread;
 use std::time::Duration;
+use tracing::{info, warn};
 
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
 use crate::persistence::{JsonFileStateStore, RelayProgressState};
@@ -84,17 +84,13 @@ pub fn run_sync_loop(
     let poll_interval = Duration::from_secs(poll_interval_secs.max(1));
     let mut loop_state = SyncLoopState::new(start_height);
 
-    info!(
-        "sync loop started: poll_interval_secs={}, start_height={}",
-        poll_interval.as_secs(),
-        start_height
-    );
+    info!(poll_interval_secs = poll_interval.as_secs(), start_height, "sync loop started");
     if let Some(state) = state_store.load().context("failed to load persisted relay state")? {
         info!(
-            "loaded persisted relay state: last_submitted_height={}, last_submitted_hash={}, updated_at={}",
-            state.last_submitted_height,
-            state.last_submitted_hash,
-            state.updated_at_unix_secs
+            last_submitted_height = state.last_submitted_height,
+            last_submitted_hash = %state.last_submitted_hash,
+            updated_at_unix_secs = state.updated_at_unix_secs,
+            "loaded persisted relay state"
         );
     } else {
         info!("no persisted relay state found yet");
@@ -109,10 +105,7 @@ pub fn run_sync_loop(
         };
 
         let cycle_result = run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store)?;
-        info!(
-            "sync poll cycle complete: poll_count={}, state={:?}, result={:?}",
-            loop_state.poll_count, loop_state.state, cycle_result
-        );
+        info!(poll_count = loop_state.poll_count, state = ?loop_state.state, result = ?cycle_result, "sync poll cycle complete");
 
         thread::sleep(poll_interval);
     }
@@ -131,16 +124,10 @@ fn run_poll_cycle(
     let relay_tip = submitter.relay_tip_height()?;
     let lag = bitcoin_tip.saturating_sub(relay_tip);
 
-    info!(
-        "tip discovery: trigger={:?}, bitcoin_tip={}, relay_tip={}, lag={}",
-        trigger, bitcoin_tip, relay_tip, lag
-    );
+    info!(trigger = ?trigger, bitcoin_tip, relay_tip, lag, "tip discovery");
 
     if relay_tip >= bitcoin_tip {
-        info!(
-            "sync is up to date: relay_tip={} >= bitcoin_tip={}, nothing to submit this cycle",
-            relay_tip, bitcoin_tip
-        );
+        info!(relay_tip, bitcoin_tip, "sync is up to date; nothing to submit this cycle");
         return Ok(SyncResult::UpToDate);
     }
 
@@ -158,12 +145,12 @@ fn run_poll_cycle(
     loop_state.state = SyncEngineState::CatchingUp;
     let progress = process_catchup_range(bitcoin, submitter, from_height, to_height, loop_state, state_store)?;
     info!(
-        "relay behind bitcoin tip: synced range {}..={}, submitted_headers={}, retries={}, lag={}",
         from_height,
         to_height,
-        progress.submitted,
-        progress.retries,
-        lag
+        submitted_headers = progress.submitted,
+        retries = progress.retries,
+        lag,
+        "relay behind bitcoin tip: catch-up cycle finished"
     );
     Ok(SyncResult::Progressed)
 }
@@ -192,10 +179,7 @@ fn process_catchup_range(
                     state_store
                         .save(&state)
                         .with_context(|| format!("failed persisting relay state at height {}", height))?;
-                    info!(
-                        "header submitted: height={}, tx_hash={}, progress={}/{}, attempt={}",
-                        height, tx_hash, submitted, total, attempt
-                    );
+                    info!(height, tx_hash = %tx_hash, submitted, total, attempt, "header submitted");
                     break;
                 }
                 Err(err) => {
@@ -205,10 +189,7 @@ fn process_catchup_range(
                             let delay_secs = backoff_delay_secs(attempt);
                             loop_state.state = SyncEngineState::RetryBackoff;
                             retries = retries.saturating_add(1);
-                            warn!(
-                                "temporary sync failure at height={}, attempt={}, retry_in={}s, reason={}",
-                                height, attempt, delay_secs, message
-                            );
+                            warn!(height, attempt, retry_in_secs = delay_secs, reason = %message, "temporary sync failure");
                             thread::sleep(Duration::from_secs(delay_secs));
                             continue;
                         }
@@ -244,12 +225,7 @@ fn process_single_height(
         .get_block_header_hex(&block_hash)
         .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
 
-    info!(
-        "submitting header: height={}, hash={}, header_hex_len={}",
-        height,
-        block_hash,
-        header_hex.len()
-    );
+    info!(height, block_hash = %block_hash, header_hex_len = header_hex.len(), "submitting header");
 
     loop_state.state = SyncEngineState::WaitingConfirmations;
     let tx_hash = submitter
@@ -319,20 +295,19 @@ fn resolve_resume_start_height(
     if let Some(state) = persisted_state {
         if state.last_submitted_height < relay_tip {
             warn!(
-                "persisted state is behind relay tip (persisted_height={}, relay_tip={}); resuming from relay tip + 1",
-                state.last_submitted_height, relay_tip
+                persisted_height = state.last_submitted_height,
+                relay_tip,
+                "persisted state is behind relay tip; resuming from relay tip + 1"
             );
         } else if state.last_submitted_height > relay_tip {
             warn!(
-                "persisted state is ahead of relay tip (persisted_height={}, relay_tip={}); relay tip remains source of truth",
-                state.last_submitted_height, relay_tip
+                persisted_height = state.last_submitted_height,
+                relay_tip,
+                "persisted state is ahead of relay tip; relay tip remains source of truth"
             );
         }
         if configured_start_height > 0 {
-            info!(
-                "ignoring START_HEIGHT={} because persisted state exists; resuming from relay tip + 1",
-                configured_start_height
-            );
+            info!(configured_start_height, "ignoring START_HEIGHT because persisted state exists; resuming from relay tip + 1");
         }
         return next_from_relay;
     }
