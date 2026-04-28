@@ -6,9 +6,13 @@ mod startup;
 mod configs;
 
 use anyhow::Result;
+use bitcoin_rpc::HttpBitcoinRpcClient;
+use btc_relay_client::EvmBtcRelaySubmitter;
 use env_logger::{Builder, Env};
 use configs::AppConfig;
 use log::info;
+use reqwest::blocking::Client;
+use std::time::Duration;
 
 fn init_logging() {
     let env = Env::default().default_filter_or("info");
@@ -31,6 +35,24 @@ fn main() -> Result<()> {
     startup::run_evm_relay_read_check(&cfg)?;
 
     info!("startup pipeline complete: config, bitcoin checks, and evm read checks are working");
+
+    let bitcoin_http = Client::builder()
+        .timeout(Duration::from_secs(cfg.bitcoin_rpc_timeout_secs))
+        .build()?;
+    let bitcoin = HttpBitcoinRpcClient::new(
+        cfg.bitcoin_rpc_url.clone(),
+        cfg.bitcoin_rpc_user.clone(),
+        cfg.bitcoin_rpc_password.clone(),
+        bitcoin_http,
+    );
+    let submitter = EvmBtcRelaySubmitter::from_config(&cfg);
+
+    sync_engine::run_sync_loop(
+        &bitcoin,
+        &submitter,
+        cfg.poll_interval_secs,
+        cfg.start_height,
+    )?;
 
     Ok(())
 }
