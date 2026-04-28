@@ -1,5 +1,12 @@
-use alloy::primitives::U256;
+use alloy::primitives::U256 as AlloyU256;
 use anyhow::{Context, Result};
+use ethers::middleware::SignerMiddleware;
+use ethers::providers::{Http, Middleware, Provider};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::{
+    transaction::eip2718::TypedTransaction, Address, Bytes, Eip1559TransactionRequest,
+    NameOrAddress, U256 as EthersU256,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::thread;
@@ -90,38 +97,55 @@ impl EvmBtcRelaySubmitter {
             anyhow::bail!("cannot send tx: EVM tx timeout must be > 0");
         }
 
-        let accounts = self
-            .rpc_request("eth_accounts", json!([]))
-            .context("failed to fetch sender account via eth_accounts")?;
-        let from = accounts
-            .as_array()
-            .and_then(|v| v.first())
-            .and_then(|v| v.as_str())
-            .context("eth_accounts returned no available unlocked accounts")?;
+        let rpc_url = self.evm_rpc_url.clone();
+        let private_key = self.relayer_private_key.clone();
+        let relay_contract_address = self.relay_contract_address.clone();
+        let chain_id = self.evm_chain_id;
+        let max_fee_gwei = self.evm_max_fee_gwei;
+        let priority_fee_gwei = self.evm_priority_fee_gwei;
+        let calldata_bytes = calldata.to_vec();
 
-        let mut tx_obj = json!({
-            "from": from,
-            "to": self.relay_contract_address,
-            "data": bytes_to_prefixed_hex(calldata),
-            "chainId": to_hex_quantity_u64(self.evm_chain_id),
-        });
-        if let Some(max_fee) = self.evm_max_fee_gwei {
-            tx_obj["maxFeePerGas"] = Value::String(to_hex_quantity_u64(max_fee * 1_000_000_000));
-        }
-        if let Some(priority_fee) = self.evm_priority_fee_gwei {
-            tx_obj["maxPriorityFeePerGas"] =
-                Value::String(to_hex_quantity_u64(priority_fee * 1_000_000_000));
-        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to initialize tokio runtime for evm tx send")?;
 
-        let tx_hash = self
-            .rpc_request("eth_sendTransaction", json!([tx_obj]))
-            .context("eth_sendTransaction failed")?
-            .as_str()
-            .context("eth_sendTransaction returned non-string tx hash")?
-            .to_string();
+        let tx_hash = runtime.block_on(async move {
+            let provider = Provider::<Http>::try_from(rpc_url.as_str())
+                .context("failed to create EVM provider")?;
+            let wallet = private_key
+                .parse::<LocalWallet>()
+                .context("invalid RELAYER_PRIVATE_KEY format")?
+                .with_chain_id(chain_id);
+            let client = SignerMiddleware::new(provider, wallet);
+
+            let to = relay_contract_address
+                .parse::<Address>()
+                .context("invalid RELAY_CONTRACT_ADDRESS")?;
+            let mut req = Eip1559TransactionRequest {
+                to: Some(NameOrAddress::Address(to)),
+                data: Some(Bytes::from(calldata_bytes)),
+                chain_id: Some(chain_id.into()),
+                ..Default::default()
+            };
+            if let Some(max_fee) = max_fee_gwei {
+                req.max_fee_per_gas = Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
+            }
+            if let Some(priority_fee) = priority_fee_gwei {
+                req.max_priority_fee_per_gas =
+                    Some(EthersU256::from(priority_fee) * EthersU256::from(1_000_000_000_u64));
+            }
+            let tx: TypedTransaction = req.into();
+
+            let pending = client
+                .send_transaction(tx, None)
+                .await
+                .context("eth_sendRawTransaction failed")?;
+            Ok::<String, anyhow::Error>(format!("{:#x}", pending.tx_hash()))
+        })?;
 
         if !is_valid_tx_hash(&tx_hash) {
-            anyhow::bail!("eth_sendTransaction returned invalid tx hash: {}", tx_hash);
+            anyhow::bail!("eth_sendRawTransaction returned invalid tx hash: {}", tx_hash);
         }
 
         Ok(tx_hash)
@@ -231,7 +255,7 @@ impl EvmBtcRelaySubmitter {
     fn build_submit_fork_calldata(&self, fork_id: u64, headers_bytes: &[u8]) -> Vec<u8> {
         let owned_headers: Vec<u8> = headers_bytes.to_vec();
         let call = IBtcRelayView::submitForkBlockheadersCall {
-            forkId: U256::try_from(fork_id).unwrap(),
+            forkId: AlloyU256::try_from(fork_id).unwrap(),
             headers: owned_headers.into(),
         };
         call.abi_encode()
@@ -311,7 +335,7 @@ impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
 
     fn relay_commit_hash(&self, height: u64) -> Result<String> {
         let call = IBtcRelayView::getCommitHashCall {
-            height: U256::try_from(height)?,
+            height: AlloyU256::try_from(height)?,
         };
         let raw = self
             .evm_call_latest(&self.relay_contract_address, &call.abi_encode())
@@ -348,10 +372,6 @@ fn bytes_to_prefixed_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", b);
     }
     out
-}
-
-fn to_hex_quantity_u64(value: u64) -> String {
-    format!("0x{:x}", value)
 }
 
 fn parse_hex_quantity_u64(value: &str) -> Result<u64> {

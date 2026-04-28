@@ -28,10 +28,13 @@ impl HttpBitcoinRpcClient {
     fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
         let payload = build_rpc_payload(method, params);
 
-        let response = self
-            .http
-            .post(&self.url)
-            .basic_auth(&self.user, Some(&self.password))
+        let request = self.http.post(&self.url);
+        let request = if self.user.trim().is_empty() && self.password.trim().is_empty() {
+            request
+        } else {
+            request.basic_auth(&self.user, Some(&self.password))
+        };
+        let response = request
             .json(&payload)
             .send()
             .with_context(|| format!("bitcoin rpc transport failed for method {}", method))?;

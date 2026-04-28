@@ -43,11 +43,12 @@ impl AppConfig {
         if !self.bitcoin_rpc_url.starts_with("http") {
             anyhow::bail!("BITCOIN_RPC_URL must start with http/https");
         }
-        if self.bitcoin_rpc_user.trim().is_empty() {
-            anyhow::bail!("BITCOIN_RPC_USER is required");
-        }
-        if self.bitcoin_rpc_password.trim().is_empty() {
-            anyhow::bail!("BITCOIN_RPC_PASSWORD is required");
+        let bitcoin_rpc_user_empty = self.bitcoin_rpc_user.trim().is_empty();
+        let bitcoin_rpc_password_empty = self.bitcoin_rpc_password.trim().is_empty();
+        if bitcoin_rpc_user_empty ^ bitcoin_rpc_password_empty {
+            anyhow::bail!(
+                "BITCOIN_RPC_USER and BITCOIN_RPC_PASSWORD must be both set or both empty"
+            );
         }
         if self.bitcoin_rpc_timeout_secs <= 0 {
             anyhow::bail!("BITCOIN_RPC_TIMEOUT_SECS must be > 0");
