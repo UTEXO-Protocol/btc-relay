@@ -58,8 +58,7 @@ impl SyncLoopState {
 
 /// Loop orchestrator entrypoint.
 ///
-/// Runs an infinite poll/sync cycle and leaves per-cycle behavior to
-/// `run_poll_cycle`, which will be expanded.
+/// Runs an infinite poll/sync cycle and leaves per-cycle behavior to `run_poll_cycle`
 pub fn run_sync_loop(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
@@ -92,13 +91,36 @@ pub fn run_sync_loop(
 }
 
 fn run_poll_cycle(
-    _bitcoin: &dyn BitcoinRpcClient,
-    _submitter: &dyn BtcRelaySubmitter,
-    _trigger: SyncTrigger,
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    trigger: SyncTrigger,
     loop_state: &mut SyncLoopState,
 ) -> Result<SyncResult> {
-    // Now: scaffold: keep loop alive and mark engine as active.
-    // Next: will implement tip discovery + catch-up processing.
     loop_state.state = SyncEngineState::Active;
-    Ok(SyncResult::UpToDate)
+
+    let bitcoin_tip = bitcoin.get_block_count()?;
+    let relay_tip = submitter.relay_tip_height()?;
+    let lag = bitcoin_tip.saturating_sub(relay_tip);
+
+    info!(
+        "tip discovery: trigger={:?}, bitcoin_tip={}, relay_tip={}, lag={}",
+        trigger, bitcoin_tip, relay_tip, lag
+    );
+
+    if relay_tip >= bitcoin_tip {
+        info!(
+            "sync is up to date: relay_tip={} >= bitcoin_tip={}, nothing to submit this cycle",
+            relay_tip, bitcoin_tip
+        );
+        return Ok(SyncResult::UpToDate);
+    }
+
+    loop_state.state = SyncEngineState::CatchingUp;
+    info!(
+        "relay behind bitcoin tip: next missing height={}, target_tip={}, lag={}",
+        relay_tip.saturating_add(1),
+        bitcoin_tip,
+        lag
+    );
+    Ok(SyncResult::Progressed)
 }
