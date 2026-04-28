@@ -24,10 +24,7 @@ sol! {
     }
 }
 
-/// Task 3 scaffolding for EVM BTC relay submitter.
-///
-/// ABI-specific contract calls are intentionally deferred to point 5
-/// (ABI integration). This module locks submitter boundaries now.
+/// EVM submitter used to read/write BTC relay contract state.
 #[allow(dead_code)]
 pub struct EvmBtcRelaySubmitter {
     pub evm_rpc_url: String,
@@ -55,7 +52,7 @@ impl EvmBtcRelaySubmitter {
         }
     }
 
-    /// Helper stub for point 3 internal structure.
+    /// Validates and decodes one raw BTC header (80 bytes / 160 hex chars).
     fn header_hex_to_bytes(&self, header_hex: &str) -> Result<Vec<u8>> {
         if header_hex.trim().is_empty() {
             anyhow::bail!("submit_header requires non-empty header");
@@ -81,7 +78,7 @@ impl EvmBtcRelaySubmitter {
         Ok(out)
     }
 
-    /// Helper stub for point 3 internal structure.
+    /// Sends encoded calldata as a transaction through the configured EVM RPC.
     fn send_tx(&self, calldata: &[u8]) -> Result<String> {
         if calldata.is_empty() {
             anyhow::bail!("cannot send header submission tx with empty calldata");
@@ -130,7 +127,7 @@ impl EvmBtcRelaySubmitter {
         Ok(tx_hash)
     }
 
-    /// Helper stub for point 3 internal structure.
+    /// Waits until the submitted tx reaches configured confirmation depth.
     fn wait_for_confirmation(&self, tx_hash: &str) -> Result<()> {
         if !is_valid_tx_hash(tx_hash) {
             anyhow::bail!(
@@ -395,4 +392,84 @@ fn hex_prefixed_to_bytes(value: &str) -> Result<Vec<u8>> {
         i += 2;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::keccak256;
+
+    fn test_submitter() -> EvmBtcRelaySubmitter {
+        EvmBtcRelaySubmitter {
+            evm_rpc_url: "http://127.0.0.1:8545".to_string(),
+            relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+            relayer_private_key: "0x01".to_string(),
+            evm_chain_id: 31337,
+            evm_tx_confirmations: 1,
+            evm_tx_timeout_secs: 10,
+            evm_max_fee_gwei: None,
+            evm_priority_fee_gwei: None,
+        }
+    }
+
+    #[test]
+    fn header_hex_to_bytes_accepts_80_byte_header() {
+        let submitter = test_submitter();
+        let input = "00".repeat(80);
+        let bytes = submitter
+            .header_hex_to_bytes(&input)
+            .expect("header should parse");
+        assert_eq!(bytes.len(), 80);
+        assert!(bytes.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn header_hex_to_bytes_rejects_invalid_length() {
+        let submitter = test_submitter();
+        let err = submitter
+            .header_hex_to_bytes("abcd")
+            .expect_err("short header should fail");
+        assert!(err.to_string().contains("requires 160 hex chars"));
+    }
+
+    #[test]
+    fn header_hex_to_bytes_rejects_non_hex_chars() {
+        let submitter = test_submitter();
+        let mut header = "00".repeat(79);
+        header.push_str("zz");
+        let err = submitter
+            .header_hex_to_bytes(&header)
+            .expect_err("non-hex header should fail");
+        assert!(err.to_string().contains("non-hex"));
+    }
+
+    #[test]
+    fn build_submit_main_calldata_has_expected_selector() {
+        let submitter = test_submitter();
+        let header_bytes = vec![0u8; 80];
+        let calldata = submitter.build_submit_main_calldata(&header_bytes);
+        assert!(calldata.len() > 4);
+
+        let selector = &calldata[..4];
+        let expected = &keccak256("submitMainBlockheaders(bytes)")[..4];
+        assert_eq!(selector, expected);
+    }
+
+    #[test]
+    fn parse_hex_quantity_handles_zero_and_regular_values() {
+        assert_eq!(parse_hex_quantity_u64("0x").expect("empty hex quantity"), 0);
+        assert_eq!(parse_hex_quantity_u64("0x0").expect("zero quantity"), 0);
+        assert_eq!(parse_hex_quantity_u64("0x2a").expect("0x2a"), 42);
+    }
+
+    #[test]
+    fn is_valid_tx_hash_checks_shape() {
+        assert!(is_valid_tx_hash(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_valid_tx_hash("0x1234"));
+        assert!(!is_valid_tx_hash(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
 }
