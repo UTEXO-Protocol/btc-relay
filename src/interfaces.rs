@@ -28,6 +28,9 @@ pub trait BitcoinRpcClient {
 pub trait BtcRelaySubmitter {
     /// Returns current relay tip height.
     fn relay_tip_height(&self) -> Result<u64>;
+    
+    /// Returns current relay chainwork as 32-byte big-endian integer bytes.
+    fn relay_chain_work_bytes(&self) -> Result<[u8; 32]>;
 
     /// Returns relay commitment hash at a given height.
     fn relay_commit_hash(&self, height: u64) -> Result<String>;

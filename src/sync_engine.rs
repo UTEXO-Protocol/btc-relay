@@ -218,20 +218,155 @@ fn process_single_height(
     loop_state: &mut SyncLoopState,
 ) -> Result<(String, String)> {
     loop_state.state = SyncEngineState::Submitting;
+    if height == 0 {
+        anyhow::bail!("cannot submit height 0: no previous stored header exists");
+    }
     let block_hash = bitcoin
         .get_block_hash(height)
         .with_context(|| format!("failed get_block_hash at height {}", height))?;
     let header_hex = bitcoin
         .get_block_header_hex(&block_hash)
         .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
+    let submit_payload_hex = build_submit_main_payload_hex(bitcoin, submitter, height, &header_hex)
+        .with_context(|| format!("failed to build submit payload at height {}", height))?;
 
     info!(height, block_hash = %block_hash, header_hex_len = header_hex.len(), "submitting header");
 
     loop_state.state = SyncEngineState::WaitingConfirmations;
     let tx_hash = submitter
-        .submit_header(&header_hex)
+        .submit_header(&submit_payload_hex)
         .with_context(|| format!("failed submit_header at height {}", height))?;
     Ok((block_hash, tx_hash))
+}
+
+fn build_submit_main_payload_hex(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    height: u64,
+    current_header_hex: &str,
+) -> Result<String> {
+    let previous_height = height.saturating_sub(1);
+    let previous_hash = bitcoin
+        .get_block_hash(previous_height)
+        .with_context(|| format!("failed get_block_hash for previous height {}", previous_height))?;
+    let previous_header_hex = bitcoin
+        .get_block_header_hex(&previous_hash)
+        .with_context(|| format!("failed get_block_header_hex for previous height {}", previous_height))?;
+
+    let previous_header_bytes = decode_even_hex(&previous_header_hex)
+        .context("failed to decode previous block header hex")?;
+    if previous_header_bytes.len() != 80 {
+        anyhow::bail!(
+            "previous block header must be 80 bytes, got {} bytes",
+            previous_header_bytes.len()
+        );
+    }
+
+    let current_header_bytes = decode_even_hex(current_header_hex)
+        .context("failed to decode current block header hex")?;
+    if current_header_bytes.len() != 80 {
+        anyhow::bail!(
+            "current block header must be 80 bytes, got {} bytes",
+            current_header_bytes.len()
+        );
+    }
+
+    if previous_height < 10 {
+        anyhow::bail!("cannot construct previous timestamp window for height {}", previous_height);
+    }
+    let mut previous_timestamps = [0_u32; 10];
+    for (idx, ts_height) in ((previous_height - 10)..previous_height).enumerate() {
+        let ts_hash = bitcoin
+            .get_block_hash(ts_height)
+            .with_context(|| format!("failed get_block_hash for timestamp height {}", ts_height))?;
+        let ts_header_hex = bitcoin
+            .get_block_header_hex(&ts_hash)
+            .with_context(|| format!("failed get_block_header_hex for timestamp height {}", ts_height))?;
+        let ts_header_bytes = decode_even_hex(ts_header_hex.as_str())
+            .with_context(|| format!("failed decode header for timestamp height {}", ts_height))?;
+        previous_timestamps[idx] = parse_timestamp_from_header(&ts_header_bytes)?;
+    }
+
+    let epoch_start_height = (previous_height / 2016) * 2016;
+    let epoch_start_hash = bitcoin
+        .get_block_hash(epoch_start_height)
+        .with_context(|| format!("failed get_block_hash for epoch start {}", epoch_start_height))?;
+    let epoch_start_header_hex = bitcoin
+        .get_block_header_hex(&epoch_start_hash)
+        .with_context(|| format!("failed get_block_header_hex for epoch start {}", epoch_start_height))?;
+    let epoch_start_header_bytes = decode_even_hex(epoch_start_header_hex.as_str())
+        .with_context(|| format!("failed decode epoch start header at {}", epoch_start_height))?;
+    let last_diff_adjustment = parse_timestamp_from_header(&epoch_start_header_bytes)?;
+
+    let chain_work = submitter
+        .relay_chain_work_bytes()
+        .context("failed to fetch relay chainwork bytes")?;
+
+    let mut payload = Vec::with_capacity(160 + 48);
+    payload.extend_from_slice(&previous_header_bytes); // 80 bytes
+    payload.extend_from_slice(&chain_work); // 32 bytes
+    payload.extend_from_slice(&(previous_height as u32).to_be_bytes()); // 4 bytes
+    payload.extend_from_slice(&last_diff_adjustment.to_be_bytes()); // 4 bytes
+    for ts in previous_timestamps {
+        payload.extend_from_slice(&ts.to_be_bytes()); // 40 bytes
+    }
+    if payload.len() != 160 {
+        anyhow::bail!("stored header payload must be 160 bytes, got {}", payload.len());
+    }
+
+    // Compact header (48 bytes): versionLE + merkleRoot + timestampLE + nBitsLE + nonce
+    payload.extend_from_slice(&current_header_bytes[0..4]); // versionLE
+    payload.extend_from_slice(&current_header_bytes[36..68]); // merkleRoot
+    payload.extend_from_slice(&current_header_bytes[68..72]); // timestampLE
+    payload.extend_from_slice(&current_header_bytes[72..76]); // nBitsLE
+    payload.extend_from_slice(&current_header_bytes[76..80]); // nonce
+
+    if payload.len() < 208 {
+        anyhow::bail!("submit payload too short: {} bytes", payload.len());
+    }
+    Ok(bytes_to_hex(&payload))
+}
+
+fn parse_timestamp_from_header(header_bytes: &[u8]) -> Result<u32> {
+    if header_bytes.len() != 80 {
+        anyhow::bail!("bitcoin header must be exactly 80 bytes");
+    }
+    let ts_le = [header_bytes[68], header_bytes[69], header_bytes[70], header_bytes[71]];
+    Ok(u32::from_le_bytes(ts_le))
+}
+
+fn decode_even_hex(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        anyhow::bail!("hex value must have even length");
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i]).context("hex contains non-hex character")?;
+        let lo = hex_nibble(bytes[i + 1]).context("hex contains non-hex character")?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
 }
 
 fn classify_retry_decision(err_message: &str) -> RetryDecision {
@@ -384,14 +519,12 @@ mod tests {
 
     struct FakeBitcoinRpc {
         hash_calls: RefCell<Vec<u64>>,
-        header_calls: RefCell<Vec<String>>,
     }
 
     impl FakeBitcoinRpc {
         fn new() -> Self {
             Self {
                 hash_calls: RefCell::new(Vec::new()),
-                header_calls: RefCell::new(Vec::new()),
             }
         }
     }
@@ -411,14 +544,17 @@ mod tests {
         }
 
         fn get_block_header_hex(&self, hash: &str) -> Result<String> {
-            self.header_calls.borrow_mut().push(hash.to_string());
-            Ok(format!("header-for-{hash}"))
+            let h = hash
+                .strip_prefix("hash-")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            Ok(fake_full_header_hex(h))
         }
     }
 
     struct FakeSubmitter {
         submitted_headers: RefCell<Vec<String>>,
-        fail_once_for_header: Option<String>,
+        fail_once: bool,
         failed_once: RefCell<bool>,
     }
 
@@ -426,15 +562,15 @@ mod tests {
         fn new() -> Self {
             Self {
                 submitted_headers: RefCell::new(Vec::new()),
-                fail_once_for_header: None,
+                fail_once: false,
                 failed_once: RefCell::new(false),
             }
         }
 
-        fn with_one_temporary_failure(header: &str) -> Self {
+        fn with_one_temporary_failure() -> Self {
             Self {
                 submitted_headers: RefCell::new(Vec::new()),
-                fail_once_for_header: Some(header.to_string()),
+                fail_once: true,
                 failed_once: RefCell::new(false),
             }
         }
@@ -445,16 +581,18 @@ mod tests {
             Ok(0)
         }
 
+        fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+            Ok([0_u8; 32])
+        }
+
         fn relay_commit_hash(&self, _height: u64) -> Result<String> {
             Ok("0x00".to_string())
         }
 
         fn submit_header(&self, header_hex: &str) -> Result<String> {
-            if let Some(target) = &self.fail_once_for_header {
-                if header_hex == target && !*self.failed_once.borrow() {
-                    *self.failed_once.borrow_mut() = true;
-                    anyhow::bail!("network timeout while submitting header");
-                }
+            if self.fail_once && !*self.failed_once.borrow() {
+                *self.failed_once.borrow_mut() = true;
+                anyhow::bail!("network timeout while submitting header");
             }
             self.submitted_headers
                 .borrow_mut()
@@ -470,42 +608,31 @@ mod tests {
         let state_store = test_state_store();
 
         let mut loop_state = super::SyncLoopState::new(0);
-        let progress = process_catchup_range(&bitcoin, &submitter, 3, 5, &mut loop_state, &state_store)
+        let progress = process_catchup_range(&bitcoin, &submitter, 13, 15, &mut loop_state, &state_store)
             .expect("pipeline");
         assert_eq!(progress.submitted, 3);
         assert_eq!(progress.retries, 0);
         assert_eq!(loop_state.state, super::SyncEngineState::WaitingConfirmations);
-        assert_eq!(bitcoin.hash_calls.borrow().as_slice(), &[3, 4, 5]);
-        assert_eq!(
-            bitcoin.header_calls.borrow().as_slice(),
-            &["hash-3".to_string(), "hash-4".to_string(), "hash-5".to_string()]
-        );
-        assert_eq!(
-            submitter.submitted_headers.borrow().as_slice(),
-            &[
-                "header-for-hash-3".to_string(),
-                "header-for-hash-4".to_string(),
-                "header-for-hash-5".to_string()
-            ]
-        );
+        assert!(bitcoin.hash_calls.borrow().contains(&13));
+        assert!(bitcoin.hash_calls.borrow().contains(&14));
+        assert!(bitcoin.hash_calls.borrow().contains(&15));
+        assert_eq!(submitter.submitted_headers.borrow().len(), 3);
+        assert!(submitter.submitted_headers.borrow().iter().all(|p| p.len() >= 416));
     }
 
     #[test]
     fn catchup_pipeline_retries_temporary_failure_and_continues() {
         let bitcoin = FakeBitcoinRpc::new();
-        let submitter = FakeSubmitter::with_one_temporary_failure("header-for-hash-3");
+        let submitter = FakeSubmitter::with_one_temporary_failure();
         let state_store = test_state_store();
         let mut loop_state = super::SyncLoopState::new(0);
 
-        let progress = process_catchup_range(&bitcoin, &submitter, 3, 4, &mut loop_state, &state_store)
+        let progress = process_catchup_range(&bitcoin, &submitter, 13, 14, &mut loop_state, &state_store)
             .expect("pipeline with retry");
 
         assert_eq!(progress.submitted, 2);
         assert_eq!(progress.retries, 1);
-        assert_eq!(
-            submitter.submitted_headers.borrow().as_slice(),
-            &["header-for-hash-3".to_string(), "header-for-hash-4".to_string()]
-        );
+        assert_eq!(submitter.submitted_headers.borrow().len(), 2);
     }
 
     #[test]
@@ -535,5 +662,23 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0)
+    }
+
+    fn fake_full_header_hex(height: u64) -> String {
+        let mut header = vec![0_u8; 80];
+        header[0..4].copy_from_slice(&1_u32.to_le_bytes()); // version
+        let merkle_seed = height.to_le_bytes();
+        for i in 0..32 {
+            header[36 + i] = merkle_seed[i % merkle_seed.len()];
+        }
+        header[68..72].copy_from_slice(&(1_700_000_000_u32.saturating_add(height as u32)).to_le_bytes()); // timestamp LE
+        header[72..76].copy_from_slice(&0x1d00ffff_u32.to_le_bytes()); // nBits LE
+        header[76..80].copy_from_slice(&(height as u32).to_le_bytes()); // nonce
+        let mut out = String::with_capacity(160);
+        for b in header {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "{:02x}", b);
+        }
+        out
     }
 }

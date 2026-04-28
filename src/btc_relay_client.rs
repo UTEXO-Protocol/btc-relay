@@ -18,12 +18,12 @@ use alloy::sol_types::SolCall;
 use crate::configs::AppConfig;
 use crate::interfaces::BtcRelaySubmitter;
 
-const BTC_HEADER_HEX_LEN: usize = 160;
 const EVM_TX_HASH_HEX_LEN: usize = 66;
 
 sol! {
     interface IBtcRelayView {
         function getBlockheight() external view returns (uint32);
+        function getChainwork() external view returns (uint224);
         function getCommitHash(uint256 height) external view returns (bytes32);
         function submitMainBlockheaders(bytes headers) external;
         function submitShortForkBlockheaders(bytes headers) external;
@@ -59,25 +59,21 @@ impl EvmBtcRelaySubmitter {
         }
     }
 
-    /// Validates and decodes one raw BTC header (80 bytes / 160 hex chars).
-    fn header_hex_to_bytes(&self, header_hex: &str) -> Result<Vec<u8>> {
-        if header_hex.trim().is_empty() {
-            anyhow::bail!("submit_header requires non-empty header");
+    /// Validates and decodes any even-length hex payload (without 0x prefix).
+    fn payload_hex_to_bytes(&self, payload_hex: &str) -> Result<Vec<u8>> {
+        if payload_hex.trim().is_empty() {
+            anyhow::bail!("submit_header requires non-empty payload");
         }
-        if header_hex.len() != BTC_HEADER_HEX_LEN {
-            anyhow::bail!(
-                "submit_header requires {} hex chars, got {}",
-                BTC_HEADER_HEX_LEN,
-                header_hex.len()
-            );
+        if payload_hex.len() % 2 != 0 {
+            anyhow::bail!("submit_header requires even-length hex payload");
         }
 
-        let mut out = Vec::with_capacity(BTC_HEADER_HEX_LEN / 2);
-        let bytes = header_hex.as_bytes();
+        let mut out = Vec::with_capacity(payload_hex.len() / 2);
+        let bytes = payload_hex.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            let hi = hex_nibble(bytes[i]).context("header contains non-hex character")?;
-            let lo = hex_nibble(bytes[i + 1]).context("header contains non-hex character")?;
+            let hi = hex_nibble(bytes[i]).context("payload contains non-hex character")?;
+            let lo = hex_nibble(bytes[i + 1]).context("payload contains non-hex character")?;
             out.push((hi << 4) | lo);
             i += 2;
         }
@@ -333,6 +329,20 @@ impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
         Ok(u64::from(height))
     }
 
+    fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+        let call = IBtcRelayView::getChainworkCall {};
+        let raw = self
+            .evm_call_latest(&self.relay_contract_address, &call.abi_encode())
+            .context("failed to call BTCRelay.getChainwork")?;
+
+        let chain_work = IBtcRelayView::getChainworkCall::abi_decode_returns(&raw)
+            .context("failed to decode BTCRelay.getChainwork return value")?;
+        let chain_work_be_28 = chain_work.to_be_bytes::<28>();
+        let mut out = [0_u8; 32];
+        out[4..].copy_from_slice(&chain_work_be_28);
+        Ok(out)
+    }
+
     fn relay_commit_hash(&self, height: u64) -> Result<String> {
         let call = IBtcRelayView::getCommitHashCall {
             height: AlloyU256::try_from(height)?,
@@ -349,8 +359,8 @@ impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
 
     fn submit_header(&self, header_hex: &str) -> Result<String> {
         let header_bytes = self
-            .header_hex_to_bytes(header_hex)
-            .context("failed to validate/convert header hex")?;
+            .payload_hex_to_bytes(header_hex)
+            .context("failed to validate/convert submit payload hex")?;
         let calldata = self.build_submit_main_calldata(&header_bytes);
 
         let tx_hash = self
@@ -433,33 +443,33 @@ mod tests {
     }
 
     #[test]
-    fn header_hex_to_bytes_accepts_80_byte_header() {
+    fn payload_hex_to_bytes_accepts_even_hex_payload() {
         let submitter = test_submitter();
         let input = "00".repeat(80);
         let bytes = submitter
-            .header_hex_to_bytes(&input)
-            .expect("header should parse");
+            .payload_hex_to_bytes(&input)
+            .expect("payload should parse");
         assert_eq!(bytes.len(), 80);
         assert!(bytes.iter().all(|b| *b == 0));
     }
 
     #[test]
-    fn header_hex_to_bytes_rejects_invalid_length() {
+    fn payload_hex_to_bytes_rejects_odd_length() {
         let submitter = test_submitter();
         let err = submitter
-            .header_hex_to_bytes("abcd")
-            .expect_err("short header should fail");
-        assert!(err.to_string().contains("requires 160 hex chars"));
+            .payload_hex_to_bytes("abc")
+            .expect_err("odd payload length should fail");
+        assert!(err.to_string().contains("even-length"));
     }
 
     #[test]
-    fn header_hex_to_bytes_rejects_non_hex_chars() {
+    fn payload_hex_to_bytes_rejects_non_hex_chars() {
         let submitter = test_submitter();
-        let mut header = "00".repeat(79);
+        let mut header = "00".repeat(3);
         header.push_str("zz");
         let err = submitter
-            .header_hex_to_bytes(&header)
-            .expect_err("non-hex header should fail");
+            .payload_hex_to_bytes(&header)
+            .expect_err("non-hex payload should fail");
         assert!(err.to_string().contains("non-hex"));
     }
 
