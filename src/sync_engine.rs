@@ -59,14 +59,18 @@ pub struct SyncLoopState {
     pub state: SyncEngineState,
     pub poll_count: u64,
     pub start_height: u64,
+    pub catchup_batch_size: u64,
+    pub live_lag_threshold: u64,
 }
 
 impl SyncLoopState {
-    fn new(start_height: u64) -> Self {
+    fn new(start_height: u64, catchup_batch_size: u64, live_lag_threshold: u64) -> Self {
         Self {
             state: SyncEngineState::Idle,
             poll_count: 0,
             start_height,
+            catchup_batch_size,
+            live_lag_threshold,
         }
     }
 }
@@ -79,12 +83,20 @@ pub fn run_sync_loop(
     submitter: &dyn BtcRelaySubmitter,
     poll_interval_secs: u64,
     start_height: u64,
+    catchup_batch_size: u64,
+    live_lag_threshold: u64,
     state_store: &JsonFileStateStore,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(poll_interval_secs.max(1));
-    let mut loop_state = SyncLoopState::new(start_height);
+    let mut loop_state = SyncLoopState::new(start_height, catchup_batch_size.max(1), live_lag_threshold);
 
-    info!(poll_interval_secs = poll_interval.as_secs(), start_height, "sync loop started");
+    info!(
+        poll_interval_secs = poll_interval.as_secs(),
+        start_height,
+        catchup_batch_size = loop_state.catchup_batch_size,
+        live_lag_threshold = loop_state.live_lag_threshold,
+        "sync loop started"
+    );
     if let Some(state) = state_store.load().context("failed to load persisted relay state")? {
         info!(
             last_submitted_height = state.last_submitted_height,
@@ -166,20 +178,43 @@ fn process_catchup_range(
     let mut submitted = 0_u64;
     let mut retries = 0_u64;
     let total = to_height.saturating_sub(from_height).saturating_add(1);
+    let mut current_height = from_height;
+    while current_height <= to_height {
+        let remaining = to_height.saturating_sub(current_height).saturating_add(1);
+        let batch_size = choose_submission_batch_size(
+            remaining,
+            loop_state.catchup_batch_size,
+            loop_state.live_lag_threshold,
+        );
+        let mode = if batch_size > 1 { "batch" } else { "live" };
+        let batch_end = current_height
+            .saturating_add(batch_size.saturating_sub(1))
+            .min(to_height);
 
-    for height in from_height..=to_height {
         let mut attempt = 0_u32;
         loop {
             attempt = attempt.saturating_add(1);
 
-            match process_single_height(bitcoin, submitter, height, loop_state) {
-                Ok((block_hash, tx_hash)) => {
-                    submitted = submitted.saturating_add(1);
-                    let state = RelayProgressState::new(height, block_hash);
+            match process_submit_batch(bitcoin, submitter, current_height, batch_end, loop_state) {
+                Ok((end_height, end_block_hash, tx_hash)) => {
+                    let batch_submitted = end_height.saturating_sub(current_height).saturating_add(1);
+                    submitted = submitted.saturating_add(batch_submitted);
+                    let state = RelayProgressState::new(end_height, end_block_hash);
                     state_store
                         .save(&state)
-                        .with_context(|| format!("failed persisting relay state at height {}", height))?;
-                    info!(height, tx_hash = %tx_hash, submitted, total, attempt, "header submitted");
+                        .with_context(|| format!("failed persisting relay state at height {}", end_height))?;
+                    info!(
+                        mode,
+                        from_height = current_height,
+                        to_height = end_height,
+                        batch_submitted,
+                        tx_hash = %tx_hash,
+                        submitted,
+                        total,
+                        attempt,
+                        "header batch submitted"
+                    );
+                    current_height = end_height.saturating_add(1);
                     break;
                 }
                 Err(err) => {
@@ -189,7 +224,15 @@ fn process_catchup_range(
                             let delay_secs = backoff_delay_secs(attempt);
                             loop_state.state = SyncEngineState::RetryBackoff;
                             retries = retries.saturating_add(1);
-                            warn!(height, attempt, retry_in_secs = delay_secs, reason = %message, "temporary sync failure");
+                            warn!(
+                                mode,
+                                from_height = current_height,
+                                to_height = batch_end,
+                                attempt,
+                                retry_in_secs = delay_secs,
+                                reason = %message,
+                                "temporary sync failure"
+                            );
                             thread::sleep(Duration::from_secs(delay_secs));
                             continue;
                         }
@@ -197,8 +240,8 @@ fn process_catchup_range(
                             loop_state.state = SyncEngineState::Error;
                             return Err(err).with_context(|| {
                                 format!(
-                                    "hard failure while processing height {} after {} attempt(s)",
-                                    height, attempt
+                                    "hard failure while processing range {}..={} after {} attempt(s)",
+                                    current_height, batch_end, attempt
                                 )
                             });
                         }
@@ -211,41 +254,48 @@ fn process_catchup_range(
     Ok(SyncProgress { submitted, retries })
 }
 
-fn process_single_height(
+fn process_submit_batch(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
-    height: u64,
+    start_height: u64,
+    end_height: u64,
     loop_state: &mut SyncLoopState,
-) -> Result<(String, String)> {
+) -> Result<(u64, String, String)> {
     loop_state.state = SyncEngineState::Submitting;
-    if height == 0 {
+    if start_height == 0 {
         anyhow::bail!("cannot submit height 0: no previous stored header exists");
     }
-    let block_hash = bitcoin
-        .get_block_hash(height)
-        .with_context(|| format!("failed get_block_hash at height {}", height))?;
-    let header_hex = bitcoin
-        .get_block_header_hex(&block_hash)
-        .with_context(|| format!("failed get_block_header_hex at height {} hash {}", height, block_hash))?;
-    let submit_payload_hex = build_submit_main_payload_hex(bitcoin, submitter, height, &header_hex)
-        .with_context(|| format!("failed to build submit payload at height {}", height))?;
+    if end_height < start_height {
+        anyhow::bail!("invalid batch range {}..{}", start_height, end_height);
+    }
+    let end_block_hash = bitcoin
+        .get_block_hash(end_height)
+        .with_context(|| format!("failed get_block_hash at height {}", end_height))?;
+    let submit_payload_hex = build_submit_main_payload_hex_for_range(bitcoin, submitter, start_height, end_height)
+        .with_context(|| format!("failed to build submit payload for range {}..{}", start_height, end_height))?;
 
-    info!(height, block_hash = %block_hash, header_hex_len = header_hex.len(), "submitting header");
+    info!(
+        mode = if end_height > start_height { "batch" } else { "live" },
+        from_height = start_height,
+        to_height = end_height,
+        payload_hex_len = submit_payload_hex.len(),
+        "submitting header batch"
+    );
 
     loop_state.state = SyncEngineState::WaitingConfirmations;
     let tx_hash = submitter
         .submit_header(&submit_payload_hex)
-        .with_context(|| format!("failed submit_header at height {}", height))?;
-    Ok((block_hash, tx_hash))
+        .with_context(|| format!("failed submit_header for range {}..{}", start_height, end_height))?;
+    Ok((end_height, end_block_hash, tx_hash))
 }
 
-fn build_submit_main_payload_hex(
+fn build_submit_main_payload_hex_for_range(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
-    height: u64,
-    current_header_hex: &str,
+    start_height: u64,
+    end_height: u64,
 ) -> Result<String> {
-    let previous_height = height.saturating_sub(1);
+    let previous_height = start_height.saturating_sub(1);
     let previous_hash = bitcoin
         .get_block_hash(previous_height)
         .with_context(|| format!("failed get_block_hash for previous height {}", previous_height))?;
@@ -259,15 +309,6 @@ fn build_submit_main_payload_hex(
         anyhow::bail!(
             "previous block header must be 80 bytes, got {} bytes",
             previous_header_bytes.len()
-        );
-    }
-
-    let current_header_bytes = decode_even_hex(current_header_hex)
-        .context("failed to decode current block header hex")?;
-    if current_header_bytes.len() != 80 {
-        anyhow::bail!(
-            "current block header must be 80 bytes, got {} bytes",
-            current_header_bytes.len()
         );
     }
 
@@ -314,17 +355,43 @@ fn build_submit_main_payload_hex(
         anyhow::bail!("stored header payload must be 160 bytes, got {}", payload.len());
     }
 
-    // Compact header (48 bytes): versionLE + merkleRoot + timestampLE + nBitsLE + nonce
-    payload.extend_from_slice(&current_header_bytes[0..4]); // versionLE
-    payload.extend_from_slice(&current_header_bytes[36..68]); // merkleRoot
-    payload.extend_from_slice(&current_header_bytes[68..72]); // timestampLE
-    payload.extend_from_slice(&current_header_bytes[72..76]); // nBitsLE
-    payload.extend_from_slice(&current_header_bytes[76..80]); // nonce
+    // Compact headers (48 bytes each): versionLE + merkleRoot + timestampLE + nBitsLE + nonce
+    for h in start_height..=end_height {
+        let current_hash = bitcoin
+            .get_block_hash(h)
+            .with_context(|| format!("failed get_block_hash for compact header height {}", h))?;
+        let current_header_hex = bitcoin
+            .get_block_header_hex(&current_hash)
+            .with_context(|| format!("failed get_block_header_hex for compact header height {}", h))?;
+        let current_header_bytes = decode_even_hex(&current_header_hex)
+            .with_context(|| format!("failed decode compact header hex at height {}", h))?;
+        if current_header_bytes.len() != 80 {
+            anyhow::bail!(
+                "current block header at height {} must be 80 bytes, got {} bytes",
+                h,
+                current_header_bytes.len()
+            );
+        }
+
+        payload.extend_from_slice(&current_header_bytes[0..4]); // versionLE
+        payload.extend_from_slice(&current_header_bytes[36..68]); // merkleRoot
+        payload.extend_from_slice(&current_header_bytes[68..72]); // timestampLE
+        payload.extend_from_slice(&current_header_bytes[72..76]); // nBitsLE
+        payload.extend_from_slice(&current_header_bytes[76..80]); // nonce
+    }
 
     if payload.len() < 208 {
         anyhow::bail!("submit payload too short: {} bytes", payload.len());
     }
     Ok(bytes_to_hex(&payload))
+}
+
+fn choose_submission_batch_size(remaining: u64, catchup_batch_size: u64, live_lag_threshold: u64) -> u64 {
+    if remaining > live_lag_threshold {
+        remaining.min(catchup_batch_size.max(1))
+    } else {
+        1
+    }
 }
 
 fn parse_timestamp_from_header(header_bytes: &[u8]) -> Result<u32> {
@@ -607,7 +674,7 @@ mod tests {
         let submitter = FakeSubmitter::new();
         let state_store = test_state_store();
 
-        let mut loop_state = super::SyncLoopState::new(0);
+        let mut loop_state = super::SyncLoopState::new(0, 16, 2);
         let progress = process_catchup_range(&bitcoin, &submitter, 13, 15, &mut loop_state, &state_store)
             .expect("pipeline");
         assert_eq!(progress.submitted, 3);
@@ -616,8 +683,8 @@ mod tests {
         assert!(bitcoin.hash_calls.borrow().contains(&13));
         assert!(bitcoin.hash_calls.borrow().contains(&14));
         assert!(bitcoin.hash_calls.borrow().contains(&15));
-        assert_eq!(submitter.submitted_headers.borrow().len(), 3);
-        assert!(submitter.submitted_headers.borrow().iter().all(|p| p.len() >= 416));
+        assert_eq!(submitter.submitted_headers.borrow().len(), 1);
+        assert_eq!(submitter.submitted_headers.borrow()[0].len(), 608);
     }
 
     #[test]
@@ -625,7 +692,7 @@ mod tests {
         let bitcoin = FakeBitcoinRpc::new();
         let submitter = FakeSubmitter::with_one_temporary_failure();
         let state_store = test_state_store();
-        let mut loop_state = super::SyncLoopState::new(0);
+        let mut loop_state = super::SyncLoopState::new(0, 16, 2);
 
         let progress = process_catchup_range(&bitcoin, &submitter, 13, 14, &mut loop_state, &state_store)
             .expect("pipeline with retry");

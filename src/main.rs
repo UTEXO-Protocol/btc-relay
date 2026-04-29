@@ -59,6 +59,8 @@ fn main() -> Result<()> {
         &submitter,
         cfg.poll_interval_secs,
         cfg.start_height,
+        cfg.catchup_batch_size,
+        cfg.live_lag_threshold,
         &state_store,
     )?;
 

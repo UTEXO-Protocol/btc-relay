@@ -25,6 +25,10 @@ pub struct AppConfig {
     pub evm_priority_fee_gwei: Option<u64>,
     pub poll_interval_secs: u64,
     pub start_height: u64,
+    #[serde(default = "default_catchup_batch_size")]
+    pub catchup_batch_size: u64,
+    #[serde(default = "default_live_lag_threshold")]
+    pub live_lag_threshold: u64,
     #[serde(default = "default_state_file_path")]
     pub state_file_path: String,
 }
@@ -82,6 +86,9 @@ impl AppConfig {
         if self.poll_interval_secs <= 0 {
             anyhow::bail!("POLL_INTERVAL_SECS must be > 0");
         }
+        if self.catchup_batch_size == 0 {
+            anyhow::bail!("CATCHUP_BATCH_SIZE must be > 0");
+        }
         if self.state_file_path.trim().is_empty() {
             anyhow::bail!("STATE_FILE_PATH must be non-empty");
         }
@@ -112,6 +119,14 @@ fn default_evm_tx_timeout_secs() -> u64 {
 
 fn default_state_file_path() -> String {
     "artifacts/relay-state.json".to_string()
+}
+
+fn default_catchup_batch_size() -> u64 {
+    16
+}
+
+fn default_live_lag_threshold() -> u64 {
+    2
 }
 
 fn is_valid_evm_address(value: &str) -> bool {
