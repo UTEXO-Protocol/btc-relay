@@ -1,9 +1,12 @@
+//! Thin HTTP JSON-RPC client for Bitcoin Core. One struct, no connection pooling magic — keep it obvious.
+
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 
 use crate::interfaces::BitcoinRpcClient;
 
+/// `getblockheader` with `verbose=false` returns **80 bytes = 160 hex chars**. Wrong length means corrupted node or wrong API.
 const BTC_HEADER_HEX_LEN: usize = 160;
 
 #[allow(dead_code)]
@@ -11,6 +14,7 @@ pub struct HttpBitcoinRpcClient {
     pub url: String,
     pub user: String,
     pub password: String,
+    /// Shared `reqwest` client (timeout configured by caller in `main` / startup).
     pub http: Client,
 }
 
@@ -25,10 +29,12 @@ impl HttpBitcoinRpcClient {
         }
     }
 
+    /// POST JSON-RPC 1.0 body, unwrap `result`, turn HTTP/jsonrpc errors into `anyhow` — boring on purpose.
     fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
         let payload = build_rpc_payload(method, params);
 
         let request = self.http.post(&self.url);
+        // Hosted RPCs often embed API key in URL; in that mode we intentionally skip basic auth.
         let request = if self.user.trim().is_empty() && self.password.trim().is_empty() {
             request
         } else {
@@ -40,6 +46,7 @@ impl HttpBitcoinRpcClient {
             .with_context(|| format!("bitcoin rpc transport failed for method {}", method))?;
 
         let status = response.status();
+        // Decode body even on non-200 so upstream RPC error payload makes it into logs.
         let body: Value = response
             .json()
             .with_context(|| format!("bitcoin rpc response json decode failed for method {}", method))?;
@@ -55,8 +62,7 @@ impl HttpBitcoinRpcClient {
         Ok(body["result"].clone())
     }
 
-    /// Returns `true` while bitcoind is in initial block download (IBD).
-    /// Uses `getblockchaininfo` → `initialblockdownload` (Bitcoin Core).
+    /// `true` = node still in IBD (`getblockchaininfo.initialblockdownload`). Don't submit headers against a half-synced view.
     pub fn initial_block_download(&self) -> Result<bool> {
         let result = self
             .rpc_call("getblockchaininfo", json!([]))
@@ -71,6 +77,7 @@ impl HttpBitcoinRpcClient {
     }
 }
 
+/// Core expects jsonrpc "1.0" and an id; we use a fixed string id because we don't multiplex responses.
 fn build_rpc_payload(method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "1.0",
@@ -97,7 +104,7 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
             .with_context(|| format!("getblockhash rpc call failed for height {}", height))?;
 
         let hash = result
-            .as_str()
+            .as_str() // Core returns hash as plain string, not object
             .context("getblockhash returned non-string result")?
             .to_string();
 
@@ -114,7 +121,7 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
             .context("getbestblockhash rpc call failed")?;
 
         let hash = result
-            .as_str()
+            .as_str() // Core returns hash as plain string, not object
             .context("getbestblockhash returned non-string result")?
             .to_string();
 
@@ -135,7 +142,7 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
             .with_context(|| format!("getblockheader rpc call failed for hash {}", hash))?;
 
         let header_hex = result
-            .as_str()
+            .as_str() // `getblockheader(..., false)` returns raw hex string
             .context("getblockheader returned non-string result")?
             .to_string();
 

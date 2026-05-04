@@ -1,3 +1,8 @@
+//! JSON file on disk — **checkpoint for humans and debugging**, not the source of truth.
+//! The contract tip wins on resume; this just records what *this process* last believed it landed.
+//!
+//! Write path uses temp file + rename so a crash mid-write doesn't leave half a JSON line.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -6,8 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayProgressState {
+    /// Last block height included in a **successful** on-chain submission in this run.
     pub last_submitted_height: u64,
+    /// Bitcoin block hash at that height (string form) — helps diff disk vs chain when someone asks "what happened?".
     pub last_submitted_hash: String,
+    /// Wall clock when we saved; good for log correlation, not consensus.
     pub updated_at_unix_secs: u64,
 }
 
@@ -23,6 +31,7 @@ impl RelayProgressState {
 
 #[derive(Debug, Clone)]
 pub struct JsonFileStateStore {
+    /// Filesystem path (`STATE_FILE_PATH`); parent dirs created on save if missing.
     path: PathBuf,
 }
 
@@ -31,6 +40,7 @@ impl JsonFileStateStore {
         Self { path: path.into() }
     }
 
+    /// `Ok(None)` if file missing — first boot or wiped TEE; not an error.
     pub fn load(&self) -> Result<Option<RelayProgressState>> {
         if !self.path.exists() {
             return Ok(None);
@@ -43,6 +53,7 @@ impl JsonFileStateStore {
         Ok(Some(state))
     }
 
+    /// Atomic-ish replace: write `.tmp` then `rename` — still not fsync-level paranoia, but better than truncate-in-place.
     pub fn save(&self, state: &RelayProgressState) -> Result<()> {
         ensure_parent_dir(&self.path)?;
 
@@ -61,6 +72,7 @@ impl JsonFileStateStore {
     }
 }
 
+/// `mkdir -p` for the state file directory so `./artifacts/...` works on a clean clone.
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -70,6 +82,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 fn current_unix_secs() -> u64 {
+    // If time goes backwards, 0 is wrong but JSON still parses — don't crash the relayer over a broken clock.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

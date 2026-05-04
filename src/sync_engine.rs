@@ -1,3 +1,7 @@
+//! The meat: poll Bitcoin vs relay, compute what's missing, pack the weird 160-byte prologue + compact headers,
+//! submit in batches, persist JSON for operators, retry when RPC whines. **Authoritative tip is always the contract** —
+//! the JSON file is gossip, not consensus.
+
 use anyhow::{Context, Result};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +10,7 @@ use tracing::{info, warn};
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
 use crate::persistence::{JsonFileStateStore, RelayProgressState};
 
-/// High-level lifecycle for the relayer sync process.
+/// Coarse FSM labels for logs / future metrics. Most transitions are `Active` ↔ `CatchingUp` in practice.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncEngineState {
@@ -20,7 +24,7 @@ pub enum SyncEngineState {
     Error,
 }
 
-/// Source of a sync attempt.
+/// Why we entered a cycle. Only `Startup` and `PollTick` are real today; `ZmqNewBlock` is wishful thinking until someone wires ZMQ.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTrigger {
@@ -31,7 +35,7 @@ pub enum SyncTrigger {
     RetryTimer,
 }
 
-/// Sync result used by loop orchestration and logs.
+/// Per-cycle outcome for logging. `ReorgDetected` / `TemporaryFailure` exist for future honesty — don't trust them blindly yet.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncResult {
@@ -41,25 +45,31 @@ pub enum SyncResult {
     TemporaryFailure,
 }
 
+/// We retry on substring matches like "timeout" because proper error taxonomy would require competence from RPC vendors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryDecision {
     Retryable,
     HardFailure,
 }
 
+/// Counters for one `process_catchup_range` invocation — how many headers advanced and how often we slept on errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SyncProgress {
     submitted: u64,
     retries: u64,
 }
 
-/// Runtime state carried by the sync orchestrator loop.
+/// Snapshot of knobs + poll generation. Mutable `state` is mostly for logging what phase we're in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncLoopState {
     pub state: SyncEngineState,
+    /// Monotonic poll counter; `1` means first iteration (logged as `Startup` trigger).
     pub poll_count: u64,
+    /// Copy of env `START_HEIGHT` — only affects resume when **no** JSON state file.
     pub start_height: u64,
+    /// Max headers per tx in catch-up mode (throttled near tip by `live_lag_threshold`).
     pub catchup_batch_size: u64,
+    /// When remaining lag ≤ this, force batch size 1 ("live" tail).
     pub live_lag_threshold: u64,
 }
 
@@ -75,9 +85,7 @@ impl SyncLoopState {
     }
 }
 
-/// Loop orchestrator entrypoint.
-///
-/// Runs an infinite poll/sync cycle and leaves per-cycle behavior to `run_poll_cycle`
+/// **Never returns** unless something fatals — that's intentional for a daemon.
 pub fn run_sync_loop(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
@@ -123,6 +131,7 @@ pub fn run_sync_loop(
     }
 }
 
+/// One iteration: refresh tips, maybe run catch-up for the whole gap, sleep handled by caller.
 fn run_poll_cycle(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
@@ -132,8 +141,10 @@ fn run_poll_cycle(
 ) -> Result<SyncResult> {
     loop_state.state = SyncEngineState::Active;
 
+    // Two truth sources each cycle: Bitcoin tip and relay tip. Everything else derives from this diff.
     let bitcoin_tip = bitcoin.get_block_count()?;
     let relay_tip = submitter.relay_tip_height()?;
+    // Saturating to avoid underflow if relay ever reports ahead (misconfig/reorg edge).
     let lag = bitcoin_tip.saturating_sub(relay_tip);
 
     info!(trigger = ?trigger, bitcoin_tip, relay_tip, lag, "tip discovery");
@@ -143,6 +154,7 @@ fn run_poll_cycle(
         return Ok(SyncResult::UpToDate);
     }
 
+    // Persisted state is advisory only; helper below still anchors to relay tip + 1.
     let persisted_state = state_store
         .load()
         .context("failed to load persisted relay state in poll cycle")?;
@@ -167,6 +179,7 @@ fn run_poll_cycle(
     Ok(SyncResult::Progressed)
 }
 
+/// Walk `from_height..=to_height` in batches; each successful batch persists JSON and logs tx hash.
 fn process_catchup_range(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
@@ -186,6 +199,7 @@ fn process_catchup_range(
             loop_state.catchup_batch_size,
             loop_state.live_lag_threshold,
         );
+        // `mode` is log-only label so dashboards can split "catch-up" vs near-tip behavior.
         let mode = if batch_size > 1 { "batch" } else { "live" };
         let batch_end = current_height
             .saturating_add(batch_size.saturating_sub(1))
@@ -199,6 +213,7 @@ fn process_catchup_range(
                 Ok((end_height, end_block_hash, tx_hash)) => {
                     let batch_submitted = end_height.saturating_sub(current_height).saturating_add(1);
                     submitted = submitted.saturating_add(batch_submitted);
+                    // Save immediately after a confirmed submission so operator state tracks on-chain progress.
                     let state = RelayProgressState::new(end_height, end_block_hash);
                     state_store
                         .save(&state)
@@ -254,6 +269,7 @@ fn process_catchup_range(
     Ok(SyncProgress { submitted, retries })
 }
 
+/// Build ABI blob for heights `[start_height, end_height]` inclusive, broadcast, return `(end_height, end_hash, tx_hash)`.
 fn process_submit_batch(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
@@ -289,12 +305,15 @@ fn process_submit_batch(
     Ok((end_height, end_block_hash, tx_hash))
 }
 
+/// Assemble the **relay contract's** `bytes` argument: fixed 160-byte prologue + 48 bytes per header (compact form).
+/// This layout is not negotiable — it matches the on-chain verifier. Read the code before "optimizing".
 fn build_submit_main_payload_hex_for_range(
     bitcoin: &dyn BitcoinRpcClient,
     submitter: &dyn BtcRelaySubmitter,
     start_height: u64,
     end_height: u64,
 ) -> Result<String> {
+    // Contract payload needs the parent of `start_height` as context.
     let previous_height = start_height.saturating_sub(1);
     let previous_hash = bitcoin
         .get_block_hash(previous_height)
@@ -328,6 +347,7 @@ fn build_submit_main_payload_hex_for_range(
         previous_timestamps[idx] = parse_timestamp_from_header(&ts_header_bytes)?;
     }
 
+    // Difficulty epochs are 2016 blocks; relay verifier wants timestamp at epoch start.
     let epoch_start_height = (previous_height / 2016) * 2016;
     let epoch_start_hash = bitcoin
         .get_block_hash(epoch_start_height)
@@ -339,23 +359,25 @@ fn build_submit_main_payload_hex_for_range(
         .with_context(|| format!("failed decode epoch start header at {}", epoch_start_height))?;
     let last_diff_adjustment = parse_timestamp_from_header(&epoch_start_header_bytes)?;
 
+    // Chainwork comes from relay contract, not local recompute — matches contract internal accumulator.
     let chain_work = submitter
         .relay_chain_work_bytes()
         .context("failed to fetch relay chainwork bytes")?;
 
+    // --- 160-byte prologue (parent header + relay context + MedianTimePast window) ---
     let mut payload = Vec::with_capacity(160 + 48);
-    payload.extend_from_slice(&previous_header_bytes); // 80 bytes
-    payload.extend_from_slice(&chain_work); // 32 bytes
-    payload.extend_from_slice(&(previous_height as u32).to_be_bytes()); // 4 bytes
-    payload.extend_from_slice(&last_diff_adjustment.to_be_bytes()); // 4 bytes
+    payload.extend_from_slice(&previous_header_bytes); // 80: full header of block before range
+    payload.extend_from_slice(&chain_work); // 32: relay chainwork (big-endian in slot)
+    payload.extend_from_slice(&(previous_height as u32).to_be_bytes()); // 4: height of that parent
+    payload.extend_from_slice(&last_diff_adjustment.to_be_bytes()); // 4: timestamp of difficulty epoch start
     for ts in previous_timestamps {
-        payload.extend_from_slice(&ts.to_be_bytes()); // 40 bytes
+        payload.extend_from_slice(&ts.to_be_bytes()); // 10×4: MTP window before parent
     }
     if payload.len() != 160 {
         anyhow::bail!("stored header payload must be 160 bytes, got {}", payload.len());
     }
 
-    // Compact headers (48 bytes each): versionLE + merkleRoot + timestampLE + nBitsLE + nonce
+    // --- 48-byte "compact" headers appended in chain order (version + merkle + time + bits + nonce, LE where Bitcoin uses LE) ---
     for h in start_height..=end_height {
         let current_hash = bitcoin
             .get_block_hash(h)
@@ -386,6 +408,7 @@ fn build_submit_main_payload_hex_for_range(
     Ok(bytes_to_hex(&payload))
 }
 
+/// Far behind → big batches (capped by `catchup_batch_size`). Near tip → single-header txs to reduce reorg/gas pain.
 fn choose_submission_batch_size(remaining: u64, catchup_batch_size: u64, live_lag_threshold: u64) -> u64 {
     if remaining > live_lag_threshold {
         remaining.min(catchup_batch_size.max(1))
@@ -394,6 +417,7 @@ fn choose_submission_batch_size(remaining: u64, catchup_batch_size: u64, live_la
     }
 }
 
+/// Bitcoin header timestamp is 4 bytes little-endian at offset 68..72.
 fn parse_timestamp_from_header(header_bytes: &[u8]) -> Result<u32> {
     if header_bytes.len() != 80 {
         anyhow::bail!("bitcoin header must be exactly 80 bytes");
@@ -402,6 +426,7 @@ fn parse_timestamp_from_header(header_bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(ts_le))
 }
 
+/// Bitcoin RPC gives header as hex string without `0x`; must be even length.
 fn decode_even_hex(value: &str) -> Result<Vec<u8>> {
     if value.len() % 2 != 0 {
         anyhow::bail!("hex value must have even length");
@@ -427,6 +452,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
+/// Lowercase hex **without** `0x` — matches what `submit_header` / contract side expect for this path.
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -436,6 +462,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Stringly-typed error handling. Ugly. Works. PRs welcome from people who enjoy classifying RPC errors.
 fn classify_retry_decision(err_message: &str) -> RetryDecision {
     let msg = err_message.to_ascii_lowercase();
     let retryable_markers = [
@@ -456,11 +483,13 @@ fn classify_retry_decision(err_message: &str) -> RetryDecision {
     RetryDecision::HardFailure
 }
 
+/// Exponential backoff capped at 2^5 seconds — keeps us from hammering a sick RPC into the ground.
 fn backoff_delay_secs(attempt: u32) -> u64 {
     let shift = attempt.saturating_sub(1).min(5);
     1_u64 << shift
 }
 
+/// Inclusive range `[from, to]` to submit. `start_height` is already resolved (relay+1 vs bootstrap override).
 fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) -> Result<(u64, u64)> {
     if relay_tip >= bitcoin_tip {
         anyhow::bail!(
@@ -488,6 +517,7 @@ fn compute_catchup_range(relay_tip: u64, bitcoin_tip: u64, start_height: u64) ->
     Ok((from_height, bitcoin_tip))
 }
 
+/// **Truth:** `relay_tip + 1`. JSON file only influences warnings and whether `START_HEIGHT` is ignored.
 fn resolve_resume_start_height(
     relay_tip: u64,
     configured_start_height: u64,
