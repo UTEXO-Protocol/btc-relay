@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Abstract ports for sync — Bitcoin RPC and on-chain relay operations (no HTTP, no ABI, no IO).
 //!
 //! Traits so the sync engine can be tested with fakes and isn't married to `reqwest` or `ethers`.

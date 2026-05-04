@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Bitcoin Core JSON-RPC over HTTP (transport + parsing only).
 //!
 //! One struct, no connection pooling magic — keep it obvious.

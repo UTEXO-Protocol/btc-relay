@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! HTTP/JSON-RPC client for the **on-chain BTCRelay contract** (reads via `eth_call`, writes via signed txs).
 //!
 //! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.

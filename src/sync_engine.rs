@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Sync orchestration: poll Bitcoin and relay tips, compute catch-up, build relay payloads (160-byte prologue + compact headers),
 //! submit in batches with retries, persist JSON for operators.
 //!

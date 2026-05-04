@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Serialize/deserialize local relay progress to a JSON file (operator checkpoint only).
 //!
 //! **Not** the source of truth — the contract tip wins on resume; this records what *this process* last believed it landed.

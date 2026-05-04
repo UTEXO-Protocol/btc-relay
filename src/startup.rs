@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Pre-flight checks: validate config and prove Bitcoin + EVM relay are reachable (no header submission).
 //!
 //! Nothing here submits a header — it's all read-only checks except burning CPU waiting on IBD.

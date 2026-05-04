@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Load `AppConfig` from environment variables and validate invariants.
 //!
 //! No secret config files, no YAML ceremony — if it's not in the process env, it doesn't exist.

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Utexo.
+// See LICENSE for copying information.
+
 //! Composition root: load config, run startup, construct gateways, start `run_sync_loop`.
 //!
 //! Flow is deliberately boring: load env, prove Bitcoin and EVM are reachable, then park in
