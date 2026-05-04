@@ -4,7 +4,7 @@
 //! `run_sync_loop` forever. If you want magic, look elsewhere; this is plumbing.
 
 mod bitcoin_rpc;
-mod btc_relay_client;
+mod evm_relay_contract_client;
 mod configs;
 mod interfaces;
 mod persistence;
@@ -13,7 +13,7 @@ mod sync_engine;
 
 use anyhow::Result;
 use bitcoin_rpc::HttpBitcoinRpcClient;
-use btc_relay_client::EvmBtcRelaySubmitter;
+use evm_relay_contract_client::EvmBtcRelaySubmitter;
 use configs::AppConfig;
 use persistence::JsonFileStateStore;
 use reqwest::blocking::Client;

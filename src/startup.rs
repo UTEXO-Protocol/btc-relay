@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
-use crate::btc_relay_client::EvmBtcRelaySubmitter;
+use crate::evm_relay_contract_client::EvmBtcRelaySubmitter;
 use crate::configs::AppConfig;
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
 
