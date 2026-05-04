@@ -1,7 +1,7 @@
-//! Sync orchestration: poll tips, compute catch-up, build relay payloads, drive submission + retries.
+//! Sync orchestration: poll Bitcoin and relay tips, compute catch-up, build relay payloads (160-byte prologue + compact headers),
+//! submit in batches with retries, persist JSON for operators.
 //!
-//! Poll Bitcoin vs relay, compute what's missing, pack the 160-byte prologue + compact headers, submit in batches,
-//! persist JSON for operators, retry when RPC whines. **Authoritative tip is always the contract** — disk state is gossip.
+//! **Authoritative tip is always the contract** — on-disk checkpoint is advisory only.
 
 use anyhow::{Context, Result};
 use std::thread;
@@ -25,7 +25,7 @@ pub enum SyncEngineState {
     Error,
 }
 
-/// Why we entered a cycle. Only `Startup` and `PollTick` are real today; `ZmqNewBlock` is wishful thinking until someone wires ZMQ.
+/// Why a poll cycle started. Today only `Startup` (first iteration) and `PollTick` are used; other variants reserved for future triggers.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTrigger {
@@ -46,7 +46,7 @@ pub enum SyncResult {
     TemporaryFailure,
 }
 
-/// We retry on substring matches like "timeout" because proper error taxonomy would require competence from RPC vendors.
+/// Retry vs abort is decided by substring heuristics on the error string (RPC errors are not typed consistently).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryDecision {
     Retryable,
@@ -534,7 +534,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Stringly-typed error handling. Ugly. Works. PRs welcome from people who enjoy classifying RPC errors.
+/// Maps error text to retry vs fatal; keep markers aligned with real RPC failure strings you see in production.
 fn classify_retry_decision(err_message: &str) -> RetryDecision {
     let msg = err_message.to_ascii_lowercase();
     let retryable_markers = [

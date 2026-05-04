@@ -26,11 +26,8 @@ use crate::interfaces::BtcRelaySubmitter;
 /// `0x` + 64 hex nibbles = 32-byte keccak tx hash. Anything else is not a real `eth_sendRawTransaction` return.
 const EVM_TX_HASH_HEX_LEN: usize = 66;
 
-// `IBtcRelayView` — alloy `sol!` mirror of the **on-chain BTCRelay** surface we invoke (name is historical; contract is BTCRelay).
-// Selectors/encoders are compile-time generated. Keep in sync with deployed bytecode or enjoy revert soup.
-//
-// View getters: sync + payload builder call these via `eth_call`. Mutations: MVP uses only `submitMainBlockheaders`;
-// fork methods exist so unused calldata builders still compile.
+// `IBtcRelayView`: alloy `sol!` view of the on-chain BTCRelay ABI we call (historical name; contract is BTCRelay).
+// Must match deployed bytecode. MVP calls only `submitMainBlockheaders`; fork entries keep unused calldata builders compiling.
 sol! {
     interface IBtcRelayView {
         function getBlockheight() external view returns (uint32);
