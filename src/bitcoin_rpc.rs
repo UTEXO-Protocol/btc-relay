@@ -1,4 +1,6 @@
-//! Thin HTTP JSON-RPC client for Bitcoin Core. One struct, no connection pooling magic — keep it obvious.
+//! Bitcoin Core JSON-RPC over HTTP (transport + parsing only).
+//!
+//! One struct, no connection pooling magic — keep it obvious.
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;

@@ -1,5 +1,7 @@
-//! All knobs come from the environment. No secret config files, no YAML ceremony — if it's not
-//! in the process env, it doesn't exist. Field names map 1:1 to env vars via `serde` + `config` crate.
+//! Load `AppConfig` from environment variables and validate invariants.
+//!
+//! No secret config files, no YAML ceremony — if it's not in the process env, it doesn't exist.
+//! Field names map 1:1 to env vars via `serde` + `config` crate.
 
 use anyhow::{Context, Result};
 use config::{Config, Environment};

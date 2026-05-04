@@ -1,4 +1,4 @@
-//! BTC header relayer — binary entrypoint.
+//! Composition root: load config, run startup, construct gateways, start `run_sync_loop`.
 //!
 //! Flow is deliberately boring: load env, prove Bitcoin and EVM are reachable, then park in
 //! `run_sync_loop` forever. If you want magic, look elsewhere; this is plumbing.
@@ -13,7 +13,7 @@ mod sync_engine;
 
 use anyhow::Result;
 use bitcoin_rpc::HttpBitcoinRpcClient;
-use evm_relay_contract_client::EvmBtcRelaySubmitter;
+use evm_relay_contract_client::EvmRelayContractClient;
 use configs::AppConfig;
 use persistence::JsonFileStateStore;
 use reqwest::blocking::Client;
@@ -55,13 +55,13 @@ fn main() -> Result<()> {
         cfg.bitcoin_rpc_password.clone(),
         bitcoin_http,
     );
-    let submitter = EvmBtcRelaySubmitter::from_config(&cfg);
+    let evm_relay_contract = EvmRelayContractClient::from_config(&cfg);
     // JSON checkpoint: nice for humans and TEEs that lose disk; sync logic still trusts on-chain tip first.
     let state_store = JsonFileStateStore::new(cfg.state_file_path.clone());
 
     sync_engine::run_sync_loop(
         &bitcoin,
-        &submitter,
+        &evm_relay_contract,
         cfg.poll_interval_secs,
         cfg.start_height,
         cfg.catchup_batch_size,

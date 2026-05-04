@@ -1,6 +1,6 @@
-//! JSON file on disk — **checkpoint for humans and debugging**, not the source of truth.
-//! The contract tip wins on resume; this just records what *this process* last believed it landed.
+//! Serialize/deserialize local relay progress to a JSON file (operator checkpoint only).
 //!
+//! **Not** the source of truth — the contract tip wins on resume; this records what *this process* last believed it landed.
 //! Write path uses temp file + rename so a crash mid-write doesn't leave half a JSON line.
 
 use anyhow::{Context, Result};

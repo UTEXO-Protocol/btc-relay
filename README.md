@@ -16,26 +16,18 @@ This project is MVP-first and intentionally narrow: one daemon process, one sync
 
 ## Architecture
 
-This is not full onion/clean architecture yet, but responsibilities are separated enough to navigate safely.
+Each module has a clear role (see `//!` headers in source). Not full onion architecture yet, but boundaries are explicit.
 
-- **Entry / wiring layer**: `src/main.rs`
-  - Load config and logging.
-  - Run startup checks.
-  - Construct dependencies and start sync loop.
-- **Startup checks layer**: `src/startup.rs`
-  - Validate config and external connectivity before loop starts.
-- **Bitcoin gateway layer**: `src/bitcoin_rpc.rs`
-  - Bitcoin JSON-RPC client (tip, hash, raw header, IBD flag).
-- **EVM relay gateway layer**: `src/evm_relay_contract_client.rs`
-  - EVM read/write client for BTCRelay contract and tx confirmations.
-- **Business logic layer**: `src/sync_engine.rs`
-  - Poll loop, catch-up range, batching mode, retry/backoff, payload assembly.
-- **State/checkpoint layer**: `src/persistence.rs`
-  - JSON checkpoint load/save (`STATE_FILE_PATH`).
-- **Shared boundaries**: `src/interfaces.rs`
-  - Traits and shared types used by sync logic.
-- **Configuration model**: `src/configs.rs`
-  - Env-to-struct config with validation/defaults.
+| Module | Responsibility |
+|--------|----------------|
+| `src/main.rs` | Composition root: wire deps, start the loop. |
+| `src/configs.rs` | Env → `AppConfig` + validation. |
+| `src/startup.rs` | Pre-flight checks (no submissions). |
+| `src/bitcoin_rpc.rs` | Bitcoin Core JSON-RPC client. |
+| `src/evm_relay_contract_client.rs` | EVM BTCRelay contract client (`EvmRelayContractClient`). |
+| `src/interfaces.rs` | Port traits (`BitcoinRpcClient`, `BtcRelaySubmitter`) + shared DTOs. |
+| `src/sync_engine.rs` | Sync loop + payload assembly + retry policy. |
+| `src/persistence.rs` | JSON checkpoint I/O only. |
 
 ## Main Runtime Flow
 
@@ -50,15 +42,15 @@ This is not full onion/clean architecture yet, but responsibilities are separate
    - persist local checkpoint
    - retry temporary failures with exponential backoff
 
-## Module Responsibility Map 
+## Module Responsibility Map (If You Need To Change X)
 
 - **Config/env vars**: `src/configs.rs`, `.env.example`
-- **Startup behavior / smoke checks**: `src/startup.rs`
-- **Bitcoin RPC integration**: `src/bitcoin_rpc.rs`
-- **EVM tx sending / ABI / confirmations**: `src/evm_relay_contract_client.rs`
-- **Sync policy, ranges, batching, retry logic**: `src/sync_engine.rs`
-- **Persisted checkpoint format/location**: `src/persistence.rs`
-- **Trait contracts/fakes for tests**: `src/interfaces.rs`
+- **Startup / smoke checks**: `src/startup.rs`
+- **Bitcoin RPC**: `src/bitcoin_rpc.rs`
+- **EVM relay contract (reads + signed txs)**: `src/evm_relay_contract_client.rs` (`EvmRelayContractClient`)
+- **Sync orchestration**: `src/sync_engine.rs`
+- **JSON checkpoint**: `src/persistence.rs`
+- **Ports / test doubles**: `src/interfaces.rs`
 
 ## Run
 

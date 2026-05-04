@@ -1,4 +1,5 @@
-//! Fail fast before we burn gas or spin the sync loop on garbage config / dead RPCs.
+//! Pre-flight checks: validate config and prove Bitcoin + EVM relay are reachable (no header submission).
+//!
 //! Nothing here submits a header — it's all read-only checks except burning CPU waiting on IBD.
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
-use crate::evm_relay_contract_client::EvmBtcRelaySubmitter;
+use crate::evm_relay_contract_client::EvmRelayContractClient;
 use crate::configs::AppConfig;
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
 
@@ -98,13 +99,13 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
 
 /// `eth_call` the relay at tip: `getBlockheight` + `getCommitHash(tip)`. No wallet spend, just proves ABI/RPC/address line up.
 pub fn run_evm_relay_read_check(cfg: &AppConfig) -> Result<()> {
-    let submitter = EvmBtcRelaySubmitter::from_config(cfg);
+    let evm_relay_contract = EvmRelayContractClient::from_config(cfg);
 
     // Same pattern as Bitcoin smoke check: one tip getter + one value-at-tip getter.
-    let tip_height = submitter
+    let tip_height = evm_relay_contract
         .relay_tip_height()
         .context("evm relay read check failed at relay_tip_height")?;
-    let tip_commit_hash = submitter.relay_commit_hash(tip_height).with_context(|| {
+    let tip_commit_hash = evm_relay_contract.relay_commit_hash(tip_height).with_context(|| {
         format!(
             "evm relay read check failed at relay_commit_hash({})",
             tip_height

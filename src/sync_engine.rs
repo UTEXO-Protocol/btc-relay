@@ -1,6 +1,7 @@
-//! The meat: poll Bitcoin vs relay, compute what's missing, pack the weird 160-byte prologue + compact headers,
-//! submit in batches, persist JSON for operators, retry when RPC whines. **Authoritative tip is always the contract** —
-//! the JSON file is gossip, not consensus.
+//! Sync orchestration: poll tips, compute catch-up, build relay payloads, drive submission + retries.
+//!
+//! Poll Bitcoin vs relay, compute what's missing, pack the 160-byte prologue + compact headers, submit in batches,
+//! persist JSON for operators, retry when RPC whines. **Authoritative tip is always the contract** — disk state is gossip.
 
 use anyhow::{Context, Result};
 use std::thread;

@@ -1,6 +1,6 @@
-//! EVM side: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC.
-//! We use **two** stacks because life is short and ABI codegen + middleware don't agree on one crate yet.
+//! HTTP/JSON-RPC client for the **on-chain BTCRelay contract** (reads via `eth_call`, writes via signed txs).
 //!
+//! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.
 //! MVP path only: `submitMainBlockheaders`. Fork helpers are compiled but unused — delete them when you're sure you won't need them.
 
 use alloy::primitives::U256 as AlloyU256;
@@ -26,10 +26,11 @@ use crate::interfaces::BtcRelaySubmitter;
 /// `0x` + 64 hex nibbles = 32-byte keccak tx hash. Anything else is not a real `eth_sendRawTransaction` return.
 const EVM_TX_HASH_HEX_LEN: usize = 66;
 
-// Solidity interface mirror — selectors and encoders generated at compile time. Keep in sync with deployed bytecode or enjoy revert soup.
+// `IBtcRelayView` — alloy `sol!` mirror of the **on-chain BTCRelay** surface we invoke (name is historical; contract is BTCRelay).
+// Selectors/encoders are compile-time generated. Keep in sync with deployed bytecode or enjoy revert soup.
 //
-// View getters: sync + payload builder call these via `eth_call` (no gas, no state change on our side).
-// Mutations: only `submitMainBlockheaders` is used in MVP; fork entries exist so calldata builders keep compiling.
+// View getters: sync + payload builder call these via `eth_call`. Mutations: MVP uses only `submitMainBlockheaders`;
+// fork methods exist so unused calldata builders still compile.
 sol! {
     interface IBtcRelayView {
         function getBlockheight() external view returns (uint32);
@@ -41,9 +42,9 @@ sol! {
     }
 }
 
-/// Holds everything needed to `eth_call` and `eth_sendRawTransaction` against one relay contract.
+/// Config + credentials to talk to **one** deployed relay contract address on **one** EVM chain.
 #[allow(dead_code)]
-pub struct EvmBtcRelaySubmitter {
+pub struct EvmRelayContractClient {
     /// JSON-RPC HTTP(S) endpoint — same string you’d paste into `cast rpc --rpc-url`.
     pub evm_rpc_url: String,
     /// Relay proxy address; both `eth_call` and txs target this contract.
@@ -63,8 +64,8 @@ pub struct EvmBtcRelaySubmitter {
 }
 
 #[allow(dead_code)]
-impl EvmBtcRelaySubmitter {
-    /// Copy strings and numbers out of `AppConfig` — submitter owns its snapshot so callers can drop the config.
+impl EvmRelayContractClient {
+    /// Copy strings and numbers out of `AppConfig` — client owns its snapshot so callers can drop the config.
     pub fn from_config(cfg: &AppConfig) -> Self {
         Self {
             evm_rpc_url: cfg.evm_rpc_url.clone(),
@@ -356,7 +357,7 @@ fn is_valid_tx_hash(value: &str) -> bool {
         && value.chars().skip(2).all(|c| c.is_ascii_hexdigit())
 }
 
-impl BtcRelaySubmitter for EvmBtcRelaySubmitter {
+impl BtcRelaySubmitter for EvmRelayContractClient {
     /// On-chain height — **the** number the sync loop uses to decide how far behind we are.
     fn relay_tip_height(&self) -> Result<u64> {
         let call = IBtcRelayView::getBlockheightCall {};
@@ -482,8 +483,8 @@ mod tests {
     use super::*;
     use alloy::primitives::keccak256;
 
-    fn test_submitter() -> EvmBtcRelaySubmitter {
-        EvmBtcRelaySubmitter {
+    fn test_relay_client() -> EvmRelayContractClient {
+        EvmRelayContractClient {
             evm_rpc_url: "http://127.0.0.1:8545".to_string(),
             relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
             relayer_private_key: "0x01".to_string(),
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn payload_hex_to_bytes_accepts_even_hex_payload() {
-        let submitter = test_submitter();
+        let submitter = test_relay_client();
         let input = "00".repeat(80);
         let bytes = submitter
             .payload_hex_to_bytes(&input)
@@ -508,7 +509,7 @@ mod tests {
 
     #[test]
     fn payload_hex_to_bytes_rejects_odd_length() {
-        let submitter = test_submitter();
+        let submitter = test_relay_client();
         let err = submitter
             .payload_hex_to_bytes("abc")
             .expect_err("odd payload length should fail");
@@ -517,7 +518,7 @@ mod tests {
 
     #[test]
     fn payload_hex_to_bytes_rejects_non_hex_chars() {
-        let submitter = test_submitter();
+        let submitter = test_relay_client();
         let mut header = "00".repeat(3);
         header.push_str("zz");
         let err = submitter
@@ -528,7 +529,7 @@ mod tests {
 
     #[test]
     fn build_submit_main_calldata_has_expected_selector() {
-        let submitter = test_submitter();
+        let submitter = test_relay_client();
         let header_bytes = vec![0u8; 80];
         let calldata = submitter.build_submit_main_calldata(&header_bytes);
         assert!(calldata.len() > 4);
