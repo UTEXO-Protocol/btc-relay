@@ -148,7 +148,8 @@ impl EvmBtcRelaySubmitter {
             };
             // Gwei → wei. Omit both fields = node estimates; set one or both = you own the fees.
             if let Some(max_fee) = max_fee_gwei {
-                req.max_fee_per_gas = Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
+                req.max_fee_per_gas =
+                    Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
             }
             if let Some(priority_fee) = priority_fee_gwei {
                 req.max_priority_fee_per_gas =
@@ -165,7 +166,10 @@ impl EvmBtcRelaySubmitter {
         })?;
 
         if !is_valid_tx_hash(&tx_hash) {
-            anyhow::bail!("eth_sendRawTransaction returned invalid tx hash: {}", tx_hash);
+            anyhow::bail!(
+                "eth_sendRawTransaction returned invalid tx hash: {}",
+                tx_hash
+            );
         }
 
         Ok(tx_hash)
@@ -224,7 +228,9 @@ impl EvmBtcRelaySubmitter {
             match receipt.status.as_deref() {
                 Some("0x1") => {} // execution succeeded
                 Some("0x0") => anyhow::bail!("transaction reverted on-chain: {}", tx_hash),
-                Some(other) => anyhow::bail!("unexpected transaction status {} for {}", other, tx_hash),
+                Some(other) => {
+                    anyhow::bail!("unexpected transaction status {} for {}", other, tx_hash)
+                }
                 None => anyhow::bail!("transaction receipt missing status for {}", tx_hash),
             }
 
@@ -232,8 +238,8 @@ impl EvmBtcRelaySubmitter {
                 .block_number
                 .as_deref()
                 .context("transaction receipt missing blockNumber")?;
-            let tx_block_num =
-                parse_hex_quantity_u64(tx_block).context("invalid tx receipt blockNumber format")?;
+            let tx_block_num = parse_hex_quantity_u64(tx_block)
+                .context("invalid tx receipt blockNumber format")?;
 
             // Chain head — "how far has the network moved since this tx landed?"
             let head = self
@@ -242,7 +248,7 @@ impl EvmBtcRelaySubmitter {
                 .as_str()
                 .context("eth_blockNumber returned non-string result")?
                 .to_string();
-            
+
             let head_num =
                 parse_hex_quantity_u64(head.as_str()).context("invalid eth_blockNumber format")?;
 

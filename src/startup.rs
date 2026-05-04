@@ -18,7 +18,10 @@ pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
 
     if cfg.start_height > 0 {
         // Non-zero START_HEIGHT is an operator override, not normal steady-state behavior.
-        warn!(start_height = cfg.start_height, "custom start height configured");
+        warn!(
+            start_height = cfg.start_height,
+            "custom start height configured"
+        );
     } else {
         info!("start height is 0; relayer will auto-discover from chain state in later tasks");
     }
@@ -44,7 +47,10 @@ pub fn wait_for_bitcoin_ibd_complete(rpc: &HttpBitcoinRpcClient, poll_secs: u64)
                 return;
             }
             Ok(true) => {
-                info!(retry_in_secs = poll_secs, "bitcoin node is still in initial block download (IBD)");
+                info!(
+                    retry_in_secs = poll_secs,
+                    "bitcoin node is still in initial block download (IBD)"
+                );
                 thread::sleep(Duration::from_secs(poll_secs));
             }
             Err(e) => {
@@ -78,14 +84,12 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
     let best_hash = rpc
         .get_best_block_hash()
         .context("bitcoin rpc smoke check failed at get_best_block_hash")?;
-    let header_hex = rpc
-        .get_block_header_hex(&best_hash)
-        .with_context(|| {
-            format!(
-                "bitcoin rpc smoke check failed at get_block_header_hex for best hash {}",
-                best_hash
-            )
-        })?;
+    let header_hex = rpc.get_block_header_hex(&best_hash).with_context(|| {
+        format!(
+            "bitcoin rpc smoke check failed at get_block_header_hex for best hash {}",
+            best_hash
+        )
+    })?;
 
     info!(tip_height, best_hash = %best_hash, header_hex_len = header_hex.len(), "bitcoin rpc smoke check passed");
 
@@ -100,9 +104,12 @@ pub fn run_evm_relay_read_check(cfg: &AppConfig) -> Result<()> {
     let tip_height = submitter
         .relay_tip_height()
         .context("evm relay read check failed at relay_tip_height")?;
-    let tip_commit_hash = submitter
-        .relay_commit_hash(tip_height)
-        .with_context(|| format!("evm relay read check failed at relay_commit_hash({})", tip_height))?;
+    let tip_commit_hash = submitter.relay_commit_hash(tip_height).with_context(|| {
+        format!(
+            "evm relay read check failed at relay_commit_hash({})",
+            tip_height
+        )
+    })?;
 
     info!(tip_height, tip_commit_hash = %tip_commit_hash, "evm relay read check passed");
 

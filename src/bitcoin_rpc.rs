@@ -47,16 +47,28 @@ impl HttpBitcoinRpcClient {
 
         let status = response.status();
         // Decode body even on non-200 so upstream RPC error payload makes it into logs.
-        let body: Value = response
-            .json()
-            .with_context(|| format!("bitcoin rpc response json decode failed for method {}", method))?;
+        let body: Value = response.json().with_context(|| {
+            format!(
+                "bitcoin rpc response json decode failed for method {}",
+                method
+            )
+        })?;
 
         if !status.is_success() {
-            anyhow::bail!("bitcoin rpc http status {} for method {}: {}", status, method, body);
+            anyhow::bail!(
+                "bitcoin rpc http status {} for method {}: {}",
+                status,
+                method,
+                body
+            );
         }
 
         if !body["error"].is_null() {
-            anyhow::bail!("bitcoin rpc returned error for method {}: {}", method, body["error"]);
+            anyhow::bail!(
+                "bitcoin rpc returned error for method {}: {}",
+                method,
+                body["error"]
+            );
         }
 
         Ok(body["result"].clone())
@@ -224,7 +236,9 @@ mod tests {
         );
 
         let err = client
-            .get_block_header_hex("0000000000000000000000000000000000000000000000000000000000000000")
+            .get_block_header_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
             .expect_err("expected invalid header length");
         assert!(
             err.to_string().contains("invalid header length"),

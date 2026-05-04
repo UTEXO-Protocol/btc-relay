@@ -58,7 +58,8 @@ impl JsonFileStateStore {
         ensure_parent_dir(&self.path)?;
 
         let tmp_path = self.path.with_extension("tmp");
-        let content = serde_json::to_string_pretty(state).context("failed to serialize state json")?;
+        let content =
+            serde_json::to_string_pretty(state).context("failed to serialize state json")?;
         fs::write(&tmp_path, content)
             .with_context(|| format!("failed writing temp state file {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &self.path).with_context(|| {

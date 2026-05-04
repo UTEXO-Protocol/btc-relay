@@ -5,19 +5,19 @@
 
 mod bitcoin_rpc;
 mod btc_relay_client;
-mod interfaces;
-mod sync_engine;
-mod startup;
 mod configs;
+mod interfaces;
 mod persistence;
+mod startup;
+mod sync_engine;
 
 use anyhow::Result;
 use bitcoin_rpc::HttpBitcoinRpcClient;
 use btc_relay_client::EvmBtcRelaySubmitter;
 use configs::AppConfig;
+use persistence::JsonFileStateStore;
 use reqwest::blocking::Client;
 use std::time::Duration;
-use persistence::JsonFileStateStore;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 

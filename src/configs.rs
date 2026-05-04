@@ -2,8 +2,8 @@
 //! in the process env, it doesn't exist. Field names map 1:1 to env vars via `serde` + `config` crate.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use config::{Config, Environment};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
