@@ -83,3 +83,7 @@ Coverage gap to keep in mind:
 - EVM client currently creates some dependencies inside methods (testability can be improved with injected abstractions).
 - Error classification for retries is string-based.
 - No production metrics/alerts layer yet (only logs).
+
+## License
+
+Copyright (C) 2026 Utexo. See [LICENSE](LICENSE) for copying information.
