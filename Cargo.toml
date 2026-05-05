@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Utexo.
+# See LICENSE for copying information.
+
 [package]
 name = "btc-relayer"
 version = "0.1.0"
