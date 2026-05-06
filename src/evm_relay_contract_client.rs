@@ -6,6 +6,7 @@
 //! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.
 //! MVP path only: `submitMainBlockheaders`. Fork helpers are compiled but unused — delete them when you're sure you won't need them.
 
+use std::sync::Arc;
 use alloy::primitives::U256 as AlloyU256;
 use anyhow::{Context, Result};
 use ethers::middleware::SignerMiddleware;
@@ -22,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use alloy::sol;
 use alloy::sol_types::SolCall;
-
 use crate::configs::AppConfig;
 use crate::interfaces::BtcRelaySubmitter;
 
@@ -61,12 +61,114 @@ pub struct EvmRelayContractClient {
     pub evm_max_fee_gwei: Option<u64>,
     /// If set, sets `maxPriorityFeePerGas` (gwei) for EIP-1559.
     pub evm_priority_fee_gwei: Option<u64>,
+    /// Transport boundary: keeps client logic testable without real RPC/provider setup.
+    transport: Arc<dyn EvmTransport>,
+}
+
+#[derive(Debug, Clone)]
+struct SendTxRequest {
+    rpc_url: String,
+    private_key: String,
+    relay_contract_address: String,
+    chain_id: u64,
+    max_fee_gwei: Option<u64>,
+    priority_fee_gwei: Option<u64>,
+    calldata: Vec<u8>,
+}
+
+trait EvmTransport: Send + Sync {
+    fn rpc_request(&self, rpc_url: &str, method: &str, params: Value) -> Result<Value>;
+    fn send_transaction(&self, request: SendTxRequest) -> Result<String>;
+}
+
+#[derive(Default)]
+struct HttpEvmTransport;
+
+impl EvmTransport for HttpEvmTransport {
+    fn rpc_request(&self, rpc_url: &str, method: &str, params: Value) -> Result<Value> {
+        #[derive(Debug, Deserialize)]
+        struct JsonRpcResponse {
+            result: Option<Value>,
+            error: Option<Value>,
+        }
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let response: JsonRpcResponse = reqwest::blocking::Client::new()
+            .post(rpc_url)
+            .json(&request)
+            .send()
+            .with_context(|| format!("{} transport failed", method))?
+            .json()
+            .with_context(|| format!("{} response decode failed", method))?;
+
+        if let Some(err) = response.error {
+            anyhow::bail!("{} returned error: {}", method, err);
+        }
+
+        response
+            .result
+            .with_context(|| format!("{} response missing result field", method))
+    }
+
+    fn send_transaction(&self, request: SendTxRequest) -> Result<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to initialize tokio runtime for evm tx send")?;
+
+        runtime.block_on(async move {
+            let provider = Provider::<Http>::try_from(request.rpc_url.as_str())
+                .context("failed to create EVM provider")?;
+            let wallet = request
+                .private_key
+                .parse::<LocalWallet>()
+                .context("invalid RELAYER_PRIVATE_KEY format")?
+                .with_chain_id(request.chain_id);
+            let client = SignerMiddleware::new(provider, wallet);
+
+            let to = request
+                .relay_contract_address
+                .parse::<Address>()
+                .context("invalid RELAY_CONTRACT_ADDRESS")?;
+            let mut req = Eip1559TransactionRequest {
+                to: Some(NameOrAddress::Address(to)),
+                data: Some(Bytes::from(request.calldata)),
+                chain_id: Some(request.chain_id.into()),
+                ..Default::default()
+            };
+            if let Some(max_fee) = request.max_fee_gwei {
+                req.max_fee_per_gas =
+                    Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
+            }
+            if let Some(priority_fee) = request.priority_fee_gwei {
+                req.max_priority_fee_per_gas =
+                    Some(EthersU256::from(priority_fee) * EthersU256::from(1_000_000_000_u64));
+            }
+            let tx: TypedTransaction = req.into();
+
+            let pending = client
+                .send_transaction(tx, None)
+                .await
+                .context("eth_sendRawTransaction failed")?;
+            Ok::<String, anyhow::Error>(format!("{:#x}", pending.tx_hash()))
+        })
+    }
 }
 
 #[allow(dead_code)]
 impl EvmRelayContractClient {
     /// Copy strings and numbers out of `AppConfig` — client owns its snapshot so callers can drop the config.
     pub fn from_config(cfg: &AppConfig) -> Self {
+        Self::from_config_with_transport(cfg, Arc::new(HttpEvmTransport))
+    }
+
+    fn from_config_with_transport(cfg: &AppConfig, transport: Arc<dyn EvmTransport>) -> Self {
         Self {
             evm_rpc_url: cfg.evm_rpc_url.clone(),
             relay_contract_address: cfg.relay_contract_address.clone(),
@@ -76,6 +178,7 @@ impl EvmRelayContractClient {
             evm_tx_timeout_secs: cfg.evm_tx_timeout_secs,
             evm_max_fee_gwei: cfg.evm_max_fee_gwei,
             evm_priority_fee_gwei: cfg.evm_priority_fee_gwei,
+            transport,
         }
     }
 
@@ -113,57 +216,14 @@ impl EvmRelayContractClient {
             anyhow::bail!("cannot send tx: EVM tx timeout must be > 0");
         }
 
-        // `async move` takes ownership — clone anything from `self` we need inside the block.
-        let rpc_url = self.evm_rpc_url.clone();
-        let private_key = self.relayer_private_key.clone();
-        let relay_contract_address = self.relay_contract_address.clone();
-        let chain_id = self.evm_chain_id;
-        let max_fee_gwei = self.evm_max_fee_gwei;
-        let priority_fee_gwei = self.evm_priority_fee_gwei;
-        let calldata_bytes = calldata.to_vec();
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to initialize tokio runtime for evm tx send")?;
-
-        let tx_hash = runtime.block_on(async move {
-            // HTTP provider: one JSON-RPC endpoint for read + send in this closure.
-            let provider = Provider::<Http>::try_from(rpc_url.as_str())
-                .context("failed to create EVM provider")?;
-            let wallet = private_key
-                .parse::<LocalWallet>()
-                .context("invalid RELAYER_PRIVATE_KEY format")?
-                .with_chain_id(chain_id);
-            // Signs txs locally; never sends the raw key to the RPC (only signed raw tx).
-            let client = SignerMiddleware::new(provider, wallet);
-
-            let to = relay_contract_address
-                .parse::<Address>()
-                .context("invalid RELAY_CONTRACT_ADDRESS")?;
-            let mut req = Eip1559TransactionRequest {
-                to: Some(NameOrAddress::Address(to)),
-                data: Some(Bytes::from(calldata_bytes)), // full calldata: selector + ABI-encoded args
-                chain_id: Some(chain_id.into()),
-                ..Default::default()
-            };
-            // Gwei → wei. Omit both fields = node estimates; set one or both = you own the fees.
-            if let Some(max_fee) = max_fee_gwei {
-                req.max_fee_per_gas =
-                    Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
-            }
-            if let Some(priority_fee) = priority_fee_gwei {
-                req.max_priority_fee_per_gas =
-                    Some(EthersU256::from(priority_fee) * EthersU256::from(1_000_000_000_u64));
-            }
-            let tx: TypedTransaction = req.into();
-
-            // `pending` resolves once the tx is in the mempool / RPC accepted it — not yet mined.
-            let pending = client
-                .send_transaction(tx, None)
-                .await
-                .context("eth_sendRawTransaction failed")?;
-            Ok::<String, anyhow::Error>(format!("{:#x}", pending.tx_hash()))
+        let tx_hash = self.transport.send_transaction(SendTxRequest {
+            rpc_url: self.evm_rpc_url.clone(),
+            private_key: self.relayer_private_key.clone(),
+            relay_contract_address: self.relay_contract_address.clone(),
+            chain_id: self.evm_chain_id,
+            max_fee_gwei: self.evm_max_fee_gwei,
+            priority_fee_gwei: self.evm_priority_fee_gwei,
+            calldata: calldata.to_vec(),
         })?;
 
         if !is_valid_tx_hash(&tx_hash) {
@@ -214,7 +274,8 @@ impl EvmRelayContractClient {
             }
 
             let receipt_value = self
-                .rpc_request("eth_getTransactionReceipt", json!([tx_hash]))
+                .transport
+                .rpc_request(&self.evm_rpc_url, "eth_getTransactionReceipt", json!([tx_hash]))
                 .with_context(|| format!("failed eth_getTransactionReceipt for {}", tx_hash))?;
 
             if receipt_value.is_null() {
@@ -244,7 +305,8 @@ impl EvmRelayContractClient {
 
             // Chain head — "how far has the network moved since this tx landed?"
             let head = self
-                .rpc_request("eth_blockNumber", json!([]))
+                .transport
+                .rpc_request(&self.evm_rpc_url, "eth_blockNumber", json!([]))
                 .context("failed to fetch eth_blockNumber")?
                 .as_str()
                 .context("eth_blockNumber returned non-string result")?
@@ -298,7 +360,9 @@ impl EvmRelayContractClient {
     fn evm_call_latest(&self, to: &str, data: &[u8]) -> Result<Vec<u8>> {
         // `data` is already full calldata for the view function (selector + args). Returns hex-encoded ABI return blob.
         let result = self
+            .transport
             .rpc_request(
+                &self.evm_rpc_url,
                 "eth_call",
                 json!([
                     {
@@ -316,38 +380,6 @@ impl EvmRelayContractClient {
         hex_prefixed_to_bytes(&result).context("eth_call returned invalid hex result")
     }
 
-    /// Generic JSON-RPC 2.0 POST — used for reads and receipt polling (not the ethers provider path).
-    fn rpc_request(&self, method: &str, params: Value) -> Result<Value> {
-        #[derive(Debug, Deserialize)]
-        struct JsonRpcResponse {
-            result: Option<Value>,
-            error: Option<Value>,
-        }
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-
-        // Fresh client per call — simple, slightly wasteful; daemon isn't latency-critical here.
-        let response: JsonRpcResponse = reqwest::blocking::Client::new()
-            .post(&self.evm_rpc_url)
-            .json(&request)
-            .send()
-            .with_context(|| format!("{} transport failed", method))?
-            .json()
-            .with_context(|| format!("{} response decode failed", method))?;
-
-        if let Some(err) = response.error {
-            anyhow::bail!("{} returned error: {}", method, err);
-        }
-
-        response
-            .result
-            .with_context(|| format!("{} response missing result field", method))
-    }
 }
 
 /// Quick shape check before we enter the receipt polling loop.
@@ -482,8 +514,46 @@ fn hex_prefixed_to_bytes(value: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use alloy::primitives::keccak256;
+    use std::sync::Mutex;
+
+    struct MockEvmTransport {
+        sent: Mutex<Vec<SendTxRequest>>,
+        rpc_methods: Mutex<Vec<String>>,
+    }
+
+    impl MockEvmTransport {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                rpc_methods: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EvmTransport for MockEvmTransport {
+        fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+            self.rpc_methods.lock().expect("rpc methods lock").push(method.to_string());
+            match method {
+                "eth_getTransactionReceipt" => Ok(json!({
+                    "status": "0x1",
+                    "blockNumber": "0x10"
+                })),
+                "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                _ => anyhow::bail!("unexpected rpc method {}", method),
+            }
+        }
+
+        fn send_transaction(&self, request: SendTxRequest) -> Result<String> {
+            self.sent.lock().expect("sent tx lock").push(request);
+            Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
+        }
+    }
 
     fn test_relay_client() -> EvmRelayContractClient {
+        test_relay_client_with_transport(Arc::new(MockEvmTransport::new()))
+    }
+
+    fn test_relay_client_with_transport(transport: Arc<dyn EvmTransport>) -> EvmRelayContractClient {
         EvmRelayContractClient {
             evm_rpc_url: "http://127.0.0.1:8545".to_string(),
             relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
@@ -493,6 +563,7 @@ mod tests {
             evm_tx_timeout_secs: 10,
             evm_max_fee_gwei: None,
             evm_priority_fee_gwei: None,
+            transport,
         }
     }
 
@@ -555,5 +626,26 @@ mod tests {
         assert!(!is_valid_tx_hash(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
+    }
+
+    #[test]
+    fn submit_header_orchestrates_send_and_confirmation_through_transport() {
+        let mock = Arc::new(MockEvmTransport::new());
+        let submitter = test_relay_client_with_transport(mock.clone());
+        let tx_hash = submitter
+            .submit_header(&"00".repeat(80))
+            .expect("submit header should succeed");
+        assert!(is_valid_tx_hash(&tx_hash));
+
+        let sent = mock.sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].calldata.is_empty());
+        drop(sent);
+
+        let methods = mock.rpc_methods.lock().expect("methods lock");
+        assert_eq!(
+            methods.as_slice(),
+            &["eth_getTransactionReceipt".to_string(), "eth_blockNumber".to_string()]
+        );
     }
 }

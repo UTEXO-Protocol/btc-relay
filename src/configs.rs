@@ -161,3 +161,68 @@ fn is_valid_evm_address(value: &str) -> bool {
         && value.starts_with("0x")
         && value.chars().skip(2).all(|c| c.is_ascii_hexdigit())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            bitcoin_rpc_url: "http://127.0.0.1:8332".to_string(),
+            bitcoin_rpc_user: "user".to_string(),
+            bitcoin_rpc_password: "pass".to_string(),
+            bitcoin_rpc_timeout_secs: 10,
+            bitcoin_ibd_poll_secs: 30,
+            evm_rpc_url: "http://127.0.0.1:8545".to_string(),
+            relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+            relayer_private_key: "0x01".to_string(),
+            evm_chain_id: 31337,
+            evm_tx_confirmations: 1,
+            evm_tx_timeout_secs: 120,
+            evm_max_fee_gwei: None,
+            evm_priority_fee_gwei: None,
+            poll_interval_secs: 5,
+            start_height: 0,
+            catchup_batch_size: 16,
+            live_lag_threshold: 2,
+            state_file_path: "artifacts/relay-state.json".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_config() {
+        valid_config().validate().expect("valid config should pass");
+    }
+
+    #[test]
+    fn validate_rejects_partial_bitcoin_auth_pair() {
+        let mut cfg = valid_config();
+        cfg.bitcoin_rpc_password.clear();
+        let err = cfg.validate().expect_err("expected auth pair error");
+        assert!(err.to_string().contains("must be both set or both empty"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_relay_address() {
+        let mut cfg = valid_config();
+        cfg.relay_contract_address = "0x1234".to_string();
+        let err = cfg.validate().expect_err("expected invalid address error");
+        assert!(err.to_string().contains("valid 0x-prefixed 20-byte hex address"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_chain_id() {
+        let mut cfg = valid_config();
+        cfg.evm_chain_id = 0;
+        let err = cfg.validate().expect_err("expected chain id error");
+        assert!(err.to_string().contains("EVM_CHAIN_ID must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_state_file_path() {
+        let mut cfg = valid_config();
+        cfg.state_file_path = "  ".to_string();
+        let err = cfg.validate().expect_err("expected state file path error");
+        assert!(err.to_string().contains("STATE_FILE_PATH must be non-empty"));
+    }
+}
