@@ -278,6 +278,26 @@ mod tests {
     }
 
     #[test]
+    fn ibd_wait_retries_after_error_then_succeeds() {
+        let rpc = FakeBitcoinClient {
+            ibd_sequence: RefCell::new(VecDeque::from(vec![
+                Err(anyhow::anyhow!("rpc down")),
+                Ok(false),
+            ])),
+            block_count: 100,
+            best_hash: "hash".to_string(),
+            header_hex: "00".repeat(80),
+            header_requests: RefCell::new(Vec::new()),
+        };
+        let sleeps = Rc::new(RefCell::new(Vec::new()));
+        let sleeps_ref = Rc::clone(&sleeps);
+        wait_for_bitcoin_ibd_complete_inner(&rpc, 5, move |dur| {
+            sleeps_ref.borrow_mut().push(dur.as_secs());
+        });
+        assert_eq!(&*sleeps.borrow(), &[5]);
+    }
+
+    #[test]
     fn bitcoin_smoke_check_runs_core_calls_after_ibd_wait() {
         let cfg = test_config();
         let rpc = FakeBitcoinClient {
@@ -300,5 +320,161 @@ mod tests {
         };
         run_evm_relay_read_check_with_client(&evm).expect("evm read check");
         assert_eq!(&*evm.commit_height_requests.borrow(), &[77]);
+    }
+
+    #[test]
+    fn bitcoin_smoke_check_propagates_block_count_failure() {
+        let cfg = test_config();
+        struct FailingBitcoin;
+        impl StartupBitcoinClient for FailingBitcoin {
+            fn initial_block_download(&self) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_block_count(&self) -> Result<u64> {
+                anyhow::bail!("count unavailable");
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("best".to_string())
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                Ok("00".repeat(80))
+            }
+        }
+
+        let err = run_bitcoin_rpc_smoke_check_with_client(&cfg, &FailingBitcoin)
+            .expect_err("expected smoke check failure");
+        assert!(err.to_string().contains("get_block_count"));
+    }
+
+    #[test]
+    fn evm_read_check_propagates_commit_hash_failure() {
+        struct FailingEvm;
+        impl StartupEvmRelayClient for FailingEvm {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(5)
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                anyhow::bail!("commit hash read failed");
+            }
+        }
+
+        let err =
+            run_evm_relay_read_check_with_client(&FailingEvm).expect_err("expected read failure");
+        assert!(err.to_string().contains("relay_commit_hash(5)"));
+    }
+
+    #[test]
+    fn run_startup_checks_propagates_config_validation_failure() {
+        let mut cfg = test_config();
+        cfg.evm_chain_id = 0;
+        let err = run_startup_checks(&cfg).expect_err("expected config validation failure");
+        assert!(err.to_string().contains("EVM_CHAIN_ID must be > 0"));
+    }
+
+    #[test]
+    fn run_startup_checks_accepts_nonzero_start_height_override() {
+        let mut cfg = test_config();
+        cfg.start_height = 12345;
+        run_startup_checks(&cfg).expect("nonzero start height should still validate");
+    }
+
+    #[test]
+    fn bitcoin_smoke_check_propagates_best_hash_failure() {
+        let cfg = test_config();
+        struct FailingBestHash;
+        impl StartupBitcoinClient for FailingBestHash {
+            fn initial_block_download(&self) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(100)
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                anyhow::bail!("best hash unavailable");
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                Ok("00".repeat(80))
+            }
+        }
+        let err = run_bitcoin_rpc_smoke_check_with_client(&cfg, &FailingBestHash)
+            .expect_err("expected best hash failure");
+        assert!(err.to_string().contains("get_best_block_hash"));
+    }
+
+    #[test]
+    fn bitcoin_smoke_check_propagates_header_fetch_failure() {
+        let cfg = test_config();
+        struct FailingHeaderFetch;
+        impl StartupBitcoinClient for FailingHeaderFetch {
+            fn initial_block_download(&self) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(100)
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("best".to_string())
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                anyhow::bail!("header fetch failed");
+            }
+        }
+        let err = run_bitcoin_rpc_smoke_check_with_client(&cfg, &FailingHeaderFetch)
+            .expect_err("expected header fetch failure");
+        assert!(err.to_string().contains("get_block_header_hex for best hash best"));
+    }
+
+    #[test]
+    fn evm_read_check_propagates_tip_height_failure() {
+        struct FailingTipHeight;
+        impl StartupEvmRelayClient for FailingTipHeight {
+            fn relay_tip_height(&self) -> Result<u64> {
+                anyhow::bail!("tip height read failed");
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                Ok("0x00".to_string())
+            }
+        }
+        let err = run_evm_relay_read_check_with_client(&FailingTipHeight)
+            .expect_err("expected tip height failure");
+        assert!(err.to_string().contains("relay_tip_height"));
+    }
+
+    #[test]
+    fn bitcoin_smoke_check_retries_ibd_then_runs_rpc_calls() {
+        let mut cfg = test_config();
+        cfg.bitcoin_ibd_poll_secs = 0;
+        let rpc = FakeBitcoinClient {
+            ibd_sequence: RefCell::new(VecDeque::from(vec![Ok(true), Ok(false)])),
+            block_count: 200,
+            best_hash: "best-hash".to_string(),
+            header_hex: "00".repeat(80),
+            header_requests: RefCell::new(Vec::new()),
+        };
+        run_bitcoin_rpc_smoke_check_with_client(&cfg, &rpc).expect("smoke check should succeed");
+        assert_eq!(
+            &*rpc.header_requests.borrow(),
+            &["best-hash".to_string()],
+            "smoke check should proceed to header fetch after IBD clears"
+        );
+    }
+
+    #[test]
+    fn bitcoin_smoke_check_retries_after_ibd_error_then_succeeds() {
+        let mut cfg = test_config();
+        cfg.bitcoin_ibd_poll_secs = 0;
+        let rpc = FakeBitcoinClient {
+            ibd_sequence: RefCell::new(VecDeque::from(vec![
+                Err(anyhow::anyhow!("temporary rpc error")),
+                Ok(false),
+            ])),
+            block_count: 333,
+            best_hash: "best-after-error".to_string(),
+            header_hex: "00".repeat(80),
+            header_requests: RefCell::new(Vec::new()),
+        };
+        run_bitcoin_rpc_smoke_check_with_client(&cfg, &rpc)
+            .expect("smoke check should recover from temporary IBD error");
+        assert_eq!(&*rpc.header_requests.borrow(), &["best-after-error".to_string()]);
     }
 }

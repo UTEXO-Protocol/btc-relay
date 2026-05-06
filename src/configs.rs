@@ -225,4 +225,52 @@ mod tests {
         let err = cfg.validate().expect_err("expected state file path error");
         assert!(err.to_string().contains("STATE_FILE_PATH must be non-empty"));
     }
+
+    #[test]
+    fn validate_rejects_non_http_bitcoin_url() {
+        let mut cfg = valid_config();
+        cfg.bitcoin_rpc_url = "ftp://node".to_string();
+        let err = cfg.validate().expect_err("expected bitcoin url error");
+        assert!(err.to_string().contains("BITCOIN_RPC_URL must start with http/https"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_catchup_batch_size() {
+        let mut cfg = valid_config();
+        cfg.catchup_batch_size = 0;
+        let err = cfg.validate().expect_err("expected catchup batch size error");
+        assert!(err.to_string().contains("CATCHUP_BATCH_SIZE must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_non_http_evm_url() {
+        let mut cfg = valid_config();
+        cfg.evm_rpc_url = "ws://node".to_string();
+        let err = cfg.validate().expect_err("expected evm url error");
+        assert!(err.to_string().contains("EVM_RPC_URL must start with http/https"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_private_key() {
+        let mut cfg = valid_config();
+        cfg.relayer_private_key = "  ".to_string();
+        let err = cfg.validate().expect_err("expected private key error");
+        assert!(err.to_string().contains("RELAYER_PRIVATE_KEY is required"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_confirmations() {
+        let mut cfg = valid_config();
+        cfg.evm_tx_confirmations = 0;
+        let err = cfg.validate().expect_err("expected confirmations error");
+        assert!(err.to_string().contains("EVM_TX_CONFIRMATIONS must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_poll_interval() {
+        let mut cfg = valid_config();
+        cfg.poll_interval_secs = 0;
+        let err = cfg.validate().expect_err("expected poll interval error");
+        assert!(err.to_string().contains("POLL_INTERVAL_SECS must be > 0"));
+    }
 }

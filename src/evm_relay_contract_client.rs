@@ -6,7 +6,6 @@
 //! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.
 //! MVP path only: `submitMainBlockheaders`. Fork helpers are compiled but unused — delete them when you're sure you won't need them.
 
-use std::sync::Arc;
 use alloy::primitives::U256 as AlloyU256;
 use anyhow::{Context, Result};
 use ethers::middleware::SignerMiddleware;
@@ -18,11 +17,13 @@ use ethers::types::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy::sol;
 use alloy::sol_types::SolCall;
+
 use crate::configs::AppConfig;
 use crate::interfaces::BtcRelaySubmitter;
 
@@ -519,6 +520,10 @@ mod tests {
     struct MockEvmTransport {
         sent: Mutex<Vec<SendTxRequest>>,
         rpc_methods: Mutex<Vec<String>>,
+        receipt_status: Mutex<String>,
+        receipt_block: Mutex<String>,
+        head_block: Mutex<String>,
+        send_hash: Mutex<String>,
     }
 
     impl MockEvmTransport {
@@ -526,6 +531,13 @@ mod tests {
             Self {
                 sent: Mutex::new(Vec::new()),
                 rpc_methods: Mutex::new(Vec::new()),
+                receipt_status: Mutex::new("0x1".to_string()),
+                receipt_block: Mutex::new("0x10".to_string()),
+                head_block: Mutex::new("0x10".to_string()),
+                send_hash: Mutex::new(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
             }
         }
     }
@@ -535,17 +547,19 @@ mod tests {
             self.rpc_methods.lock().expect("rpc methods lock").push(method.to_string());
             match method {
                 "eth_getTransactionReceipt" => Ok(json!({
-                    "status": "0x1",
-                    "blockNumber": "0x10"
+                    "status": self.receipt_status.lock().expect("receipt status lock").clone(),
+                    "blockNumber": self.receipt_block.lock().expect("receipt block lock").clone()
                 })),
-                "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                "eth_blockNumber" => Ok(Value::String(
+                    self.head_block.lock().expect("head block lock").clone(),
+                )),
                 _ => anyhow::bail!("unexpected rpc method {}", method),
             }
         }
 
         fn send_transaction(&self, request: SendTxRequest) -> Result<String> {
             self.sent.lock().expect("sent tx lock").push(request);
-            Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
+            Ok(self.send_hash.lock().expect("send hash lock").clone())
         }
     }
 
@@ -618,6 +632,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_hex_quantity_rejects_missing_prefix_and_invalid_digits() {
+        let missing_prefix =
+            parse_hex_quantity_u64("2a").expect_err("missing 0x prefix should fail");
+        assert!(missing_prefix.to_string().contains("must start with 0x"));
+
+        let bad_digits = parse_hex_quantity_u64("0xgg").expect_err("invalid hex should fail");
+        assert!(bad_digits.to_string().contains("failed to parse hex quantity"));
+    }
+
+    #[test]
     fn is_valid_tx_hash_checks_shape() {
         assert!(is_valid_tx_hash(
             "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -647,5 +671,361 @@ mod tests {
             methods.as_slice(),
             &["eth_getTransactionReceipt".to_string(), "eth_blockNumber".to_string()]
         );
+    }
+
+    #[test]
+    fn submit_header_fails_when_transport_returns_invalid_tx_hash() {
+        let mock = Arc::new(MockEvmTransport::new());
+        *mock.send_hash.lock().expect("send hash lock") = "0x1234".to_string();
+        let submitter = test_relay_client_with_transport(mock);
+        let err = submitter
+            .submit_header(&"00".repeat(80))
+            .expect_err("invalid tx hash should fail");
+        assert!(err
+            .to_string()
+            .contains("failed to send header submission transaction"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_reverted_receipt() {
+        let mock = Arc::new(MockEvmTransport::new());
+        *mock.receipt_status.lock().expect("receipt status lock") = "0x0".to_string();
+        let submitter = test_relay_client_with_transport(mock);
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("reverted receipt should fail");
+        assert!(err.to_string().contains("reverted on-chain"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_invalid_hash_shape_early() {
+        let submitter = test_relay_client();
+        let err = submitter
+            .wait_for_confirmation("0x1234")
+            .expect_err("invalid hash should fail");
+        assert!(err.to_string().contains("invalid tx hash format"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_unexpected_status_value() {
+        let mock = Arc::new(MockEvmTransport::new());
+        *mock.receipt_status.lock().expect("receipt status lock") = "0x2".to_string();
+        let submitter = test_relay_client_with_transport(mock);
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("unexpected status should fail");
+        assert!(err.to_string().contains("unexpected transaction status"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_missing_block_number() {
+        struct MissingBlockTransport;
+        impl EvmTransport for MissingBlockTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => Ok(json!({"status":"0x1"})),
+                    "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(MissingBlockTransport));
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("missing blockNumber should fail");
+        assert!(err.to_string().contains("missing blockNumber"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_missing_status() {
+        struct MissingStatusTransport;
+        impl EvmTransport for MissingStatusTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => Ok(json!({"blockNumber":"0x10"})),
+                    "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(MissingStatusTransport));
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("missing status should fail");
+        assert!(err.to_string().contains("missing status"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_non_string_head_block() {
+        struct NonStringHeadTransport;
+        impl EvmTransport for NonStringHeadTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => {
+                        Ok(json!({"status":"0x1","blockNumber":"0x10"}))
+                    }
+                    "eth_blockNumber" => Ok(json!({"not":"a string"})),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(NonStringHeadTransport));
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("non-string head should fail");
+        assert!(err.to_string().contains("eth_blockNumber returned non-string result"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_invalid_receipt_block_number_format() {
+        struct BadReceiptBlockTransport;
+        impl EvmTransport for BadReceiptBlockTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => {
+                        Ok(json!({"status":"0x1","blockNumber":"zz"}))
+                    }
+                    "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(BadReceiptBlockTransport));
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("bad receipt blockNumber should fail");
+        assert!(err
+            .to_string()
+            .contains("invalid tx receipt blockNumber format"));
+    }
+
+    #[test]
+    fn relay_tip_height_fails_on_non_hex_eth_call_result() {
+        struct BadEthCallTransport;
+        impl EvmTransport for BadEthCallTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_call" => Ok(Value::String("not-hex".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(BadEthCallTransport));
+        let err = submitter
+            .relay_tip_height()
+            .expect_err("invalid eth_call result should fail");
+        assert!(err.to_string().contains("failed to call BTCRelay.getBlockheight"));
+    }
+
+    #[test]
+    fn relay_commit_hash_fails_when_eth_call_result_is_not_string() {
+        struct NonStringEthCallTransport;
+        impl EvmTransport for NonStringEthCallTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_call" => Ok(json!({"not":"a string"})),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(NonStringEthCallTransport));
+        let err = submitter
+            .relay_commit_hash(1)
+            .expect_err("non-string eth_call result should fail");
+        assert!(err
+            .to_string()
+            .contains("failed to call BTCRelay.getCommitHash(1)"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_times_out_when_receipt_stays_pending() {
+        struct PendingReceiptTransport;
+        impl EvmTransport for PendingReceiptTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => Ok(Value::Null),
+                    "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let mut submitter = test_relay_client_with_transport(Arc::new(PendingReceiptTransport));
+        submitter.evm_tx_timeout_secs = 1;
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("pending receipt should eventually timeout");
+        assert!(err.to_string().contains("timed out waiting for tx confirmation"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_zero_confirmation_setting() {
+        let mut submitter = test_relay_client();
+        submitter.evm_tx_confirmations = 0;
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("zero confirmations should fail");
+        assert!(err.to_string().contains("EVM_TX_CONFIRMATIONS must be > 0"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_zero_timeout_setting() {
+        let mut submitter = test_relay_client();
+        submitter.evm_tx_timeout_secs = 0;
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("zero timeout should fail");
+        assert!(err.to_string().contains("EVM_TX_TIMEOUT_SECS must be > 0"));
+    }
+
+    #[test]
+    fn submit_header_rejects_empty_payload_before_transport() {
+        let submitter = test_relay_client();
+        let err = submitter
+            .submit_header("")
+            .expect_err("empty payload should fail");
+        assert!(err
+            .to_string()
+            .contains("failed to validate/convert submit payload hex"));
+    }
+
+    #[test]
+    fn relay_chain_work_bytes_fails_when_eth_call_result_is_not_string() {
+        struct NonStringEthCallTransport;
+        impl EvmTransport for NonStringEthCallTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_call" => Ok(json!({"unexpected":"object"})),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(NonStringEthCallTransport));
+        let err = submitter
+            .relay_chain_work_bytes()
+            .expect_err("non-string eth_call should fail");
+        assert!(err.to_string().contains("failed to call BTCRelay.getChainwork"));
+    }
+
+    #[test]
+    fn relay_chain_work_bytes_fails_on_invalid_hex_payload() {
+        struct BadHexEthCallTransport;
+        impl EvmTransport for BadHexEthCallTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_call" => Ok(Value::String("0xzz".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(BadHexEthCallTransport));
+        let err = submitter
+            .relay_chain_work_bytes()
+            .expect_err("invalid hex eth_call should fail");
+        assert!(err.to_string().contains("failed to call BTCRelay.getChainwork"));
+    }
+
+    #[test]
+    fn relay_chain_work_bytes_fails_on_wrong_abi_shape() {
+        struct WrongAbiShapeTransport;
+        impl EvmTransport for WrongAbiShapeTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_call" => Ok(Value::String("0x01".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(WrongAbiShapeTransport));
+        let err = submitter
+            .relay_chain_work_bytes()
+            .expect_err("wrong abi shape should fail");
+        assert!(err
+            .to_string()
+            .contains("failed to decode BTCRelay.getChainwork return value"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_rejects_invalid_head_block_format() {
+        struct BadHeadFormatTransport;
+        impl EvmTransport for BadHeadFormatTransport {
+            fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "eth_getTransactionReceipt" => {
+                        Ok(json!({"status":"0x1","blockNumber":"0x10"}))
+                    }
+                    "eth_blockNumber" => Ok(Value::String("zz".to_string())),
+                    _ => anyhow::bail!("unexpected rpc method {}", method),
+                }
+            }
+            fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
+                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string())
+            }
+        }
+        let submitter = test_relay_client_with_transport(Arc::new(BadHeadFormatTransport));
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("bad head format should fail");
+        assert!(err.to_string().contains("invalid eth_blockNumber format"));
     }
 }
