@@ -6,20 +6,13 @@
 //! Flow is deliberately boring: load env, prove Bitcoin and EVM are reachable, then park in
 //! `run_sync_loop` forever. If you want magic, look elsewhere; this is plumbing.
 
-mod bitcoin_rpc;
-mod evm_relay_contract_client;
-mod configs;
-mod interfaces;
-mod persistence;
-mod startup;
-mod sync_engine;
-
 use anyhow::Result;
-use bitcoin_rpc::HttpBitcoinRpcClient;
-use configs::AppConfig;
-use evm_relay_contract_client::EvmRelayContractClient;
-use interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
-use persistence::JsonFileStateStore;
+use btc_relayer::bitcoin_rpc::HttpBitcoinRpcClient;
+use btc_relayer::configs::AppConfig;
+use btc_relayer::evm_relay_contract_client::EvmRelayContractClient;
+use btc_relayer::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+use btc_relayer::persistence::JsonFileStateStore;
+use btc_relayer::{startup, sync_engine};
 use reqwest::blocking::Client;
 use std::time::Duration;
 use tracing::info;
