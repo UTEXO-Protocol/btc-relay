@@ -1,0 +1,30 @@
+groups:
+  - name: btc-relay
+    interval: 30s
+    rules:
+      - alert: BtcRelayLagHigh
+        expr: relay_lag_blocks > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "BTC relay lag is high"
+          description: "relay_lag_blocks has been above 100 for 10 minutes."
+
+      - alert: BtcRelaySyncErrors
+        expr: increase(sync_poll_cycle_errors_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "BTC relay sync cycle errors detected"
+          description: "sync_poll_cycle_errors_total increased in the last 10 minutes."
+
+      - alert: BtcRelayLowFundsByTxCount
+        expr: relayer_est_txs_left_at_current_fee < 25
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "BTC relayer funds are running low"
+          description: "Estimated remaining tx count is below 25 for 5 minutes."

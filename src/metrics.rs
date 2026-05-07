@@ -8,6 +8,7 @@ use prometheus::{
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
     register_int_gauge_with_registry,
 };
+use serde_json::json;
 use std::sync::OnceLock;
 use std::thread;
 
@@ -206,19 +207,136 @@ pub fn start_exporter(bind_addr: &str) -> Result<()> {
     thread::spawn(move || {
         let encoder = TextEncoder::new();
         for request in server.incoming_requests() {
-            if request.url() != "/metrics" {
-                let _ = request.respond(tiny_http::Response::empty(404));
-                continue;
+            match request.url() {
+                "/metrics" => {
+                    let metric_families = registry().gather();
+                    let mut buffer = Vec::new();
+                    if encoder.encode(&metric_families, &mut buffer).is_err() {
+                        let _ = request.respond(tiny_http::Response::empty(500));
+                        continue;
+                    }
+                    let response = tiny_http::Response::from_data(buffer);
+                    let _ = request.respond(response);
+                }
+                "/status" => {
+                    let body = build_status_json();
+                    let mut response = tiny_http::Response::from_string(body);
+                    if let Ok(header) = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json; charset=utf-8"[..],
+                    ) {
+                        response = response.with_header(header);
+                    }
+                    let _ = request.respond(response);
+                }
+                "/" => {
+                    let mut response = tiny_http::Response::from_string(build_status_page_html());
+                    if let Ok(header) = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    ) {
+                        response = response.with_header(header);
+                    }
+                    let _ = request.respond(response);
+                }
+                _ => {
+                    let _ = request.respond(tiny_http::Response::empty(404));
+                }
             }
-            let metric_families = registry().gather();
-            let mut buffer = Vec::new();
-            if encoder.encode(&metric_families, &mut buffer).is_err() {
-                let _ = request.respond(tiny_http::Response::empty(500));
-                continue;
-            }
-            let response = tiny_http::Response::from_data(buffer);
-            let _ = request.respond(response);
         }
     });
     Ok(())
+}
+
+fn build_status_json() -> String {
+    let m = metrics();
+    json!({
+        "sync": {
+            "bitcoin_tip_height": m.bitcoin_tip_height.get(),
+            "relay_tip_height": m.relay_tip_height.get(),
+            "relay_lag_blocks": m.relay_lag_blocks.get(),
+            "sync_poll_cycles_total": m.sync_poll_cycles_total.get(),
+            "sync_poll_progressed_total": m.sync_poll_progressed_total.get(),
+            "sync_poll_up_to_date_total": m.sync_poll_up_to_date_total.get(),
+            "sync_poll_cycle_errors_total": m.sync_poll_cycle_errors_total.get(),
+            "sync_headers_submitted_total": m.sync_headers_submitted_total.get(),
+            "sync_retries_total": m.sync_retries_total.get()
+        },
+        "wallet": {
+            "relayer_wallet_balance_eth": m.relayer_wallet_balance_eth.get(),
+            "relayer_wallet_balance_wei": m.relayer_wallet_balance_wei.get(),
+            "relayer_est_txs_left_at_current_fee": m.relayer_est_txs_left_at_current_fee.get()
+        },
+        "cost": {
+            "relayer_tx_confirmed_total": m.relayer_tx_confirmed_total.get(),
+            "relayer_tx_fee_eth_total": m.relayer_tx_fee_eth_total.get(),
+            "relayer_tx_fee_wei_total": m.relayer_tx_fee_wei_total.get()
+        }
+    })
+    .to_string()
+}
+
+fn build_status_page_html() -> &'static str {
+    r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BTC Relay Status</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background:#0b1220; color:#e5e7eb; }
+    h1 { margin: 0 0 12px 0; }
+    .muted { color:#9ca3af; margin-bottom: 18px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap:14px; }
+    .card { background:#111827; border:1px solid #374151; border-radius:10px; padding:14px; }
+    .k { color:#93c5fd; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    .v { font-size:24px; font-weight:700; margin-top:4px; }
+    .small { font-size:13px; color:#9ca3af; margin-top:6px; }
+    a { color:#60a5fa; }
+  </style>
+</head>
+<body>
+  <h1>BTC Relay Status</h1>
+  <div class="muted">Auto-refresh every 5s. Raw endpoints: <a href="/status">/status</a> and <a href="/metrics">/metrics</a></div>
+  <div class="grid">
+    <div class="card"><div class="k">Relay Lag</div><div class="v" id="relay_lag_blocks">-</div><div class="small">blocks behind Bitcoin tip</div></div>
+    <div class="card"><div class="k">Bitcoin Tip</div><div class="v" id="bitcoin_tip_height">-</div></div>
+    <div class="card"><div class="k">Relay Tip</div><div class="v" id="relay_tip_height">-</div></div>
+    <div class="card"><div class="k">Wallet Balance (ETH)</div><div class="v" id="relayer_wallet_balance_eth">-</div></div>
+    <div class="card"><div class="k">Estimated TXs Left</div><div class="v" id="relayer_est_txs_left_at_current_fee">-</div></div>
+    <div class="card"><div class="k">Confirmed TXs</div><div class="v" id="relayer_tx_confirmed_total">-</div></div>
+    <div class="card"><div class="k">Fee Spent (ETH)</div><div class="v" id="relayer_tx_fee_eth_total">-</div></div>
+    <div class="card"><div class="k">Headers Submitted</div><div class="v" id="sync_headers_submitted_total">-</div></div>
+    <div class="card"><div class="k">Poll Errors</div><div class="v" id="sync_poll_cycle_errors_total">-</div></div>
+  </div>
+  <script>
+    async function refresh() {
+      try {
+        const res = await fetch('/status');
+        const s = await res.json();
+        const values = {
+          relay_lag_blocks: s.sync.relay_lag_blocks,
+          bitcoin_tip_height: s.sync.bitcoin_tip_height,
+          relay_tip_height: s.sync.relay_tip_height,
+          relayer_wallet_balance_eth: Number(s.wallet.relayer_wallet_balance_eth).toFixed(6),
+          relayer_est_txs_left_at_current_fee: Math.floor(s.wallet.relayer_est_txs_left_at_current_fee),
+          relayer_tx_confirmed_total: s.cost.relayer_tx_confirmed_total,
+          relayer_tx_fee_eth_total: Number(s.cost.relayer_tx_fee_eth_total).toFixed(6),
+          sync_headers_submitted_total: s.sync.sync_headers_submitted_total,
+          sync_poll_cycle_errors_total: s.sync.sync_poll_cycle_errors_total
+        };
+        for (const [id, value] of Object.entries(values)) {
+          const el = document.getElementById(id);
+          if (el) el.textContent = value;
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
+"#
 }
