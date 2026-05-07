@@ -22,6 +22,7 @@ struct Metrics {
     sync_retries_total: IntCounter,
     relayer_tx_confirmed_total: IntCounter,
     relayer_tx_fee_wei_total: Gauge,
+    relayer_tx_fee_eth_total: Gauge,
     bitcoin_tip_height: IntGauge,
     relay_tip_height: IntGauge,
     relay_lag_blocks: IntGauge,
@@ -96,6 +97,11 @@ fn metrics() -> &'static Metrics {
                 registry
             )
             .expect("register relayer_tx_fee_wei_total"),
+            relayer_tx_fee_eth_total: register_gauge_with_registry!(
+                opts!("relayer_tx_fee_eth_total", "Cumulative relayer transaction fees in ETH"),
+                registry
+            )
+            .expect("register relayer_tx_fee_eth_total"),
             bitcoin_tip_height: register_int_gauge_with_registry!(
                 opts!("bitcoin_tip_height", "Latest Bitcoin tip height seen by sync loop"),
                 registry
@@ -185,6 +191,8 @@ pub fn record_confirmed_tx_fee_wei(tx_fee_wei: f64) {
     m.relayer_tx_confirmed_total.inc();
     m.relayer_tx_fee_wei_total
         .set(m.relayer_tx_fee_wei_total.get() + tx_fee_wei);
+    m.relayer_tx_fee_eth_total
+        .set(m.relayer_tx_fee_eth_total.get() + (tx_fee_wei / 1_000_000_000_000_000_000_f64));
 }
 
 pub fn set_estimated_txs_left(value: f64) {
