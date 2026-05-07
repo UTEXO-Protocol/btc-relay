@@ -46,17 +46,21 @@ fn test_config(bitcoin_url: String, evm_url: String) -> AppConfig {
         bitcoin_ibd_poll_secs: 1,
         evm_rpc_url: evm_url,
         relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
-        relayer_private_key: "0x01".to_string(),
+        relayer_private_key:
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
         evm_chain_id: 31337,
         evm_tx_confirmations: 1,
         evm_tx_timeout_secs: 10,
         evm_max_fee_gwei: None,
         evm_priority_fee_gwei: None,
+        evm_low_balance_txs_left_warn: 50,
         poll_interval_secs: 5,
         start_height: 0,
         catchup_batch_size: 16,
         live_lag_threshold: 2,
         state_file_path: "artifacts/relay-state.json".to_string(),
+        metrics_bind_addr: "127.0.0.1:9090".to_string(),
     }
 }
 
@@ -95,6 +99,7 @@ fn evm_startup_read_check_succeeds_against_mock_rpc_server() {
     let evm_url = spawn_json_rpc_server(vec![
         format!(r#"{{"result":"{}","error":null,"id":1}}"#, height_abi),
         format!(r#"{{"result":"{}","error":null,"id":1}}"#, commit_hash),
+        r#"{"result":"0xde0b6b3a7640000","error":null,"id":1}"#.to_string(),
     ]);
     let cfg = test_config("http://127.0.0.1:8332".to_string(), evm_url);
     startup::run_evm_relay_read_check(&cfg).expect("evm read check should pass");

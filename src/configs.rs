@@ -42,6 +42,9 @@ pub struct AppConfig {
     pub evm_max_fee_gwei: Option<u64>,
     /// Optional `maxPriorityFeePerGas` in gwei.
     pub evm_priority_fee_gwei: Option<u64>,
+    #[serde(default = "default_evm_low_balance_txs_left_warn")]
+    /// Warn when estimated remaining tx count (at recent fee level) drops below this value.
+    pub evm_low_balance_txs_left_warn: u64,
     /// Sleep between sync loop iterations when we're caught up or idle.
     pub poll_interval_secs: u64,
     /// Bootstrap override: first height to consider when **no** JSON state file exists. After that, on-chain tip wins.
@@ -55,6 +58,9 @@ pub struct AppConfig {
     #[serde(default = "default_state_file_path")]
     /// Where we dump last-submitted height/hash JSON for operators (not the authority for resume — contract is).
     pub state_file_path: String,
+    #[serde(default = "default_metrics_bind_addr")]
+    /// Bind address for Prometheus scrape endpoint (`GET /metrics`).
+    pub metrics_bind_addr: String,
 }
 
 impl AppConfig {
@@ -118,6 +124,9 @@ impl AppConfig {
         if self.state_file_path.trim().is_empty() {
             anyhow::bail!("STATE_FILE_PATH must be non-empty");
         }
+        if self.metrics_bind_addr.trim().is_empty() {
+            anyhow::bail!("METRICS_BIND_ADDR must be non-empty");
+        }
 
         Ok(())
     }
@@ -143,6 +152,10 @@ fn default_evm_tx_timeout_secs() -> u64 {
     120 // receipt polling budget.
 }
 
+fn default_evm_low_balance_txs_left_warn() -> u64 {
+    50 // warning threshold for "how many txs left" at current observed fee.
+}
+
 fn default_state_file_path() -> String {
     "artifacts/relay-state.json".to_string()
 }
@@ -153,6 +166,10 @@ fn default_catchup_batch_size() -> u64 {
 
 fn default_live_lag_threshold() -> u64 {
     2 // within this many blocks of tip → single-header txs.
+}
+
+fn default_metrics_bind_addr() -> String {
+    "0.0.0.0:9090".to_string()
 }
 
 /// Cheap `0x` + 20-byte hex check. Not checksum-validated — we're not doing UX here.
@@ -181,11 +198,13 @@ mod tests {
             evm_tx_timeout_secs: 120,
             evm_max_fee_gwei: None,
             evm_priority_fee_gwei: None,
+            evm_low_balance_txs_left_warn: 50,
             poll_interval_secs: 5,
             start_height: 0,
             catchup_batch_size: 16,
             live_lag_threshold: 2,
             state_file_path: "artifacts/relay-state.json".to_string(),
+            metrics_bind_addr: "127.0.0.1:9090".to_string(),
         }
     }
 
@@ -272,5 +291,20 @@ mod tests {
         cfg.poll_interval_secs = 0;
         let err = cfg.validate().expect_err("expected poll interval error");
         assert!(err.to_string().contains("POLL_INTERVAL_SECS must be > 0"));
+    }
+
+    #[test]
+    fn validate_accepts_zero_low_balance_warn_threshold() {
+        let mut cfg = valid_config();
+        cfg.evm_low_balance_txs_left_warn = 0;
+        cfg.validate().expect("zero threshold disables low-balance warnings");
+    }
+
+    #[test]
+    fn validate_rejects_empty_metrics_bind_addr() {
+        let mut cfg = valid_config();
+        cfg.metrics_bind_addr = " ".to_string();
+        let err = cfg.validate().expect_err("expected metrics bind addr error");
+        assert!(err.to_string().contains("METRICS_BIND_ADDR must be non-empty"));
     }
 }

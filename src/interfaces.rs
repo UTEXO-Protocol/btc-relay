@@ -51,4 +51,16 @@ pub trait BtcRelaySubmitter {
     /// Submit headers: `header_hex` is **no-0x**, even length; may be one header or a **batch** ABI encoding from the sync engine.
     /// Returns the tx hash so logs can correlate on-chain receipts.
     fn submit_header(&self, header_hex: &str) -> Result<String>;
+
+    /// Optional capability: relayer wallet address used for sending txs.
+    /// Backends that do not manage a wallet can keep the default "unsupported" behavior.
+    fn relayer_wallet_address(&self) -> Result<String> {
+        anyhow::bail!("relayer wallet address not supported by this submitter")
+    }
+
+    /// Optional capability: relayer wallet balance in wei.
+    /// Backends that do not manage a wallet can keep the default "unsupported" behavior.
+    fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256> {
+        anyhow::bail!("relayer wallet balance not supported by this submitter")
+    }
 }

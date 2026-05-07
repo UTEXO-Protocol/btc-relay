@@ -20,3 +20,5 @@ serde_json = "1"
 alloy = "2.0.1"
 ethers = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+prometheus = "0.13"
+tiny_http = "0.12"

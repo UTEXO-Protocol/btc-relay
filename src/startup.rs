@@ -12,9 +12,10 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::bitcoin_rpc::HttpBitcoinRpcClient;
-use crate::evm_relay_contract_client::EvmRelayContractClient;
 use crate::configs::AppConfig;
+use crate::evm_relay_contract_client::EvmRelayContractClient;
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+use crate::metrics;
 
 trait StartupBitcoinClient {
     fn initial_block_download(&self) -> Result<bool>;
@@ -44,6 +45,8 @@ impl StartupBitcoinClient for HttpBitcoinRpcClient {
 trait StartupEvmRelayClient {
     fn relay_tip_height(&self) -> Result<u64>;
     fn relay_commit_hash(&self, height: u64) -> Result<String>;
+    fn relayer_wallet_address(&self) -> Result<String>;
+    fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256>;
 }
 
 impl StartupEvmRelayClient for EvmRelayContractClient {
@@ -54,11 +57,23 @@ impl StartupEvmRelayClient for EvmRelayContractClient {
     fn relay_commit_hash(&self, height: u64) -> Result<String> {
         BtcRelaySubmitter::relay_commit_hash(self, height)
     }
+
+    fn relayer_wallet_address(&self) -> Result<String> {
+        EvmRelayContractClient::relayer_wallet_address(self)
+    }
+
+    fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256> {
+        EvmRelayContractClient::relayer_wallet_balance_wei(self)
+    }
 }
 
 /// Cheap config pass before network calls.
 pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
-    cfg.validate()?;
+    if let Err(err) = cfg.validate() {
+        metrics::observe_startup_check("config_validate", false);
+        return Err(err);
+    }
+    metrics::observe_startup_check("config_validate", true);
 
     if cfg.start_height > 0 {
         // Non-zero START_HEIGHT is an operator override, not normal steady-state behavior.
@@ -129,7 +144,9 @@ pub fn run_bitcoin_rpc_smoke_check(cfg: &AppConfig) -> Result<()> {
         cfg.bitcoin_rpc_password.clone(),
         http,
     );
-    run_bitcoin_rpc_smoke_check_with_client(cfg, &rpc)
+    let result = run_bitcoin_rpc_smoke_check_with_client(cfg, &rpc);
+    metrics::observe_startup_check("bitcoin_rpc_smoke_check", result.is_ok());
+    result
 }
 
 fn run_bitcoin_rpc_smoke_check_with_client<C>(cfg: &AppConfig, rpc: &C) -> Result<()>
@@ -160,7 +177,9 @@ where
 /// `eth_call` the relay at tip: `getBlockheight` + `getCommitHash(tip)`. No wallet spend, just proves ABI/RPC/address line up.
 pub fn run_evm_relay_read_check(cfg: &AppConfig) -> Result<()> {
     let evm_relay_contract = EvmRelayContractClient::from_config(cfg);
-    run_evm_relay_read_check_with_client(&evm_relay_contract)
+    let result = run_evm_relay_read_check_with_client(&evm_relay_contract);
+    metrics::observe_startup_check("evm_relay_read_check", result.is_ok());
+    result
 }
 
 fn run_evm_relay_read_check_with_client<C>(evm_relay_contract: &C) -> Result<()>
@@ -177,8 +196,24 @@ where
             tip_height
         )
     })?;
+    let wallet_address = evm_relay_contract
+        .relayer_wallet_address()
+        .context("evm relay read check failed at relayer_wallet_address")?;
+    let wallet_balance_wei = evm_relay_contract
+        .relayer_wallet_balance_wei()
+        .context("evm relay read check failed at relayer_wallet_balance_wei")?;
+    let wallet_balance_wei_f64 = wallet_balance_wei.to_string().parse::<f64>().unwrap_or(0.0);
+    let wallet_balance_eth = wallet_balance_wei_f64 / 1_000_000_000_000_000_000_f64;
+    metrics::set_relayer_wallet_balance(wallet_balance_wei_f64, wallet_balance_eth);
 
-    info!(tip_height, tip_commit_hash = %tip_commit_hash, "evm relay read check passed");
+    info!(
+        tip_height,
+        tip_commit_hash = %tip_commit_hash,
+        wallet_address = %wallet_address,
+        wallet_balance_wei = %wallet_balance_wei,
+        wallet_balance_eth,
+        "evm relay read check passed"
+    );
 
     Ok(())
 }
@@ -224,6 +259,8 @@ mod tests {
         tip_height: u64,
         commit_hash: String,
         commit_height_requests: RefCell<Vec<u64>>,
+        wallet_address: String,
+        wallet_balance_wei: alloy::primitives::U256,
     }
 
     impl StartupEvmRelayClient for FakeEvmClient {
@@ -234,6 +271,14 @@ mod tests {
         fn relay_commit_hash(&self, height: u64) -> Result<String> {
             self.commit_height_requests.borrow_mut().push(height);
             Ok(self.commit_hash.clone())
+        }
+
+        fn relayer_wallet_address(&self) -> Result<String> {
+            Ok(self.wallet_address.clone())
+        }
+
+        fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256> {
+            Ok(self.wallet_balance_wei)
         }
     }
 
@@ -252,11 +297,13 @@ mod tests {
             evm_tx_timeout_secs: 30,
             evm_max_fee_gwei: None,
             evm_priority_fee_gwei: None,
+            evm_low_balance_txs_left_warn: 50,
             poll_interval_secs: 5,
             start_height: 0,
             catchup_batch_size: 16,
             live_lag_threshold: 2,
             state_file_path: "artifacts/relay-state.json".to_string(),
+            metrics_bind_addr: "127.0.0.1:9090".to_string(),
         }
     }
 
@@ -317,6 +364,8 @@ mod tests {
             tip_height: 77,
             commit_hash: "0x00".to_string(),
             commit_height_requests: RefCell::new(Vec::new()),
+            wallet_address: "0x1111111111111111111111111111111111111111".to_string(),
+            wallet_balance_wei: alloy::primitives::U256::from(1_u64),
         };
         run_evm_relay_read_check_with_client(&evm).expect("evm read check");
         assert_eq!(&*evm.commit_height_requests.borrow(), &[77]);
@@ -355,6 +404,12 @@ mod tests {
             }
             fn relay_commit_hash(&self, _height: u64) -> Result<String> {
                 anyhow::bail!("commit hash read failed");
+            }
+            fn relayer_wallet_address(&self) -> Result<String> {
+                Ok("0x1111111111111111111111111111111111111111".to_string())
+            }
+            fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256> {
+                Ok(alloy::primitives::U256::from(1_u64))
             }
         }
 
@@ -433,6 +488,12 @@ mod tests {
             }
             fn relay_commit_hash(&self, _height: u64) -> Result<String> {
                 Ok("0x00".to_string())
+            }
+            fn relayer_wallet_address(&self) -> Result<String> {
+                Ok("0x1111111111111111111111111111111111111111".to_string())
+            }
+            fn relayer_wallet_balance_wei(&self) -> Result<alloy::primitives::U256> {
+                Ok(alloy::primitives::U256::from(1_u64))
             }
         }
         let err = run_evm_relay_read_check_with_client(&FailingTipHeight)
