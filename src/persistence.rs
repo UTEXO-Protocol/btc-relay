@@ -97,11 +97,16 @@ fn current_unix_secs() -> u64 {
 mod tests {
     use super::*;
     use std::env;
+    use std::fs;
 
     #[test]
     fn json_store_roundtrip_load_save() {
         let mut path = env::temp_dir();
-        path.push(format!("btc-relay-state-test-{}.json", std::process::id()));
+        path.push(format!(
+            "btc-relay-state-test-roundtrip-{}-{}.json",
+            std::process::id(),
+            current_test_timestamp()
+        ));
 
         let store = JsonFileStateStore::new(&path);
         let state = RelayProgressState::new(123, "abcd".to_string());
@@ -111,5 +116,58 @@ mod tests {
         assert_eq!(loaded.last_submitted_hash, "abcd");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_returns_none_when_file_is_missing() {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "btc-relay-state-test-missing-{}-{}.json",
+            std::process::id(),
+            current_test_timestamp()
+        ));
+        let _ = fs::remove_file(&path);
+        let store = JsonFileStateStore::new(path);
+        let loaded = store.load().expect("missing file should not error");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_returns_error_for_corrupted_json() {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "btc-relay-state-test-corrupt-{}-{}.json",
+            std::process::id(),
+            current_test_timestamp()
+        ));
+        fs::write(&path, "{this-is-not-json").expect("write corrupt file");
+        let store = JsonFileStateStore::new(&path);
+        let err = store.load().expect_err("expected parse error");
+        assert!(err.to_string().contains("failed parsing state file"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_creates_parent_directories() {
+        let mut dir = env::temp_dir();
+        dir.push(format!(
+            "btc-relay-state-dir-{}-{}",
+            std::process::id(),
+            current_test_timestamp()
+        ));
+        let path = dir.join("nested").join("state.json");
+        let store = JsonFileStateStore::new(&path);
+        let state = RelayProgressState::new(1, "h".to_string());
+        store.save(&state).expect("save with nested parent");
+        assert!(path.exists(), "state file should exist after save");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn current_test_timestamp() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
     }
 }

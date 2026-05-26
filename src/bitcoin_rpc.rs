@@ -186,7 +186,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    fn spawn_test_server(response_body: &'static str) -> String {
+    fn spawn_test_server(status_line: &'static str, response_body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
 
@@ -195,7 +195,8 @@ mod tests {
             let mut req_buf = [0_u8; 2048];
             let _ = stream.read(&mut req_buf);
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
                 response_body.len(),
                 response_body
             );
@@ -219,6 +220,7 @@ mod tests {
     #[test]
     fn initial_block_download_reads_flag_from_blockchain_info() {
         let url = spawn_test_server(
+            "200 OK",
             r#"{"result":{"chain":"regtest","blocks":1,"initialblockdownload":false},"error":null,"id":"btc-relayer"}"#,
         );
         let client = HttpBitcoinRpcClient::new(
@@ -232,7 +234,7 @@ mod tests {
 
     #[test]
     fn rejects_header_with_invalid_length() {
-        let url = spawn_test_server(r#"{"result":"abcd","error":null,"id":"btc-relayer"}"#);
+        let url = spawn_test_server("200 OK", r#"{"result":"abcd","error":null,"id":"btc-relayer"}"#);
         let client = HttpBitcoinRpcClient::new(
             url,
             "user".to_string(),
@@ -250,5 +252,64 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn get_block_count_parses_numeric_result() {
+        let url = spawn_test_server("200 OK", r#"{"result":777,"error":null,"id":"btc-relayer"}"#);
+        let client = HttpBitcoinRpcClient::new(
+            url,
+            "user".to_string(),
+            "pass".to_string(),
+            Client::builder().build().expect("client"),
+        );
+        assert_eq!(client.get_block_count().expect("block count"), 777);
+    }
+
+    #[test]
+    fn get_block_hash_rejects_empty_result_string() {
+        let url = spawn_test_server("200 OK", r#"{"result":"  ","error":null,"id":"btc-relayer"}"#);
+        let client = HttpBitcoinRpcClient::new(
+            url,
+            "user".to_string(),
+            "pass".to_string(),
+            Client::builder().build().expect("client"),
+        );
+        let err = client.get_block_hash(1).expect_err("expected empty hash error");
+        assert!(err.to_string().contains("empty hash"));
+    }
+
+    #[test]
+    fn get_best_block_hash_rejects_rpc_error_payload() {
+        let url = spawn_test_server(
+            "200 OK",
+            r#"{"result":null,"error":{"code":-32601,"message":"method not found"},"id":"btc-relayer"}"#,
+        );
+        let client = HttpBitcoinRpcClient::new(
+            url,
+            "user".to_string(),
+            "pass".to_string(),
+            Client::builder().build().expect("client"),
+        );
+        let err = client
+            .get_best_block_hash()
+            .expect_err("expected rpc error to propagate");
+        assert!(err.to_string().contains("getbestblockhash rpc call failed"));
+    }
+
+    #[test]
+    fn rpc_call_surfaces_non_success_http_status() {
+        let url = spawn_test_server(
+            "500 Internal Server Error",
+            r#"{"result":null,"error":{"code":-1,"message":"boom"},"id":"btc-relayer"}"#,
+        );
+        let client = HttpBitcoinRpcClient::new(
+            url,
+            "user".to_string(),
+            "pass".to_string(),
+            Client::builder().build().expect("client"),
+        );
+        let err = client.get_block_count().expect_err("expected http status error");
+        assert!(err.to_string().contains("getblockcount rpc call failed"));
     }
 }

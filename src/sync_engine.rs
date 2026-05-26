@@ -12,6 +12,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+use crate::metrics;
 use crate::persistence::{JsonFileStateStore, RelayProgressState};
 
 /// Coarse FSM labels for logs / future metrics. Most transitions are `Active` ↔ `CatchingUp` in practice.
@@ -126,6 +127,7 @@ pub fn run_sync_loop(
 
     loop {
         loop_state.poll_count = loop_state.poll_count.saturating_add(1);
+        metrics::inc_sync_poll_cycle();
         let trigger = if loop_state.poll_count == 1 {
             SyncTrigger::Startup
         } else {
@@ -133,7 +135,13 @@ pub fn run_sync_loop(
         };
 
         let cycle_result =
-            run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store)?;
+            match run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store) {
+                Ok(result) => result,
+                Err(err) => {
+                    metrics::inc_sync_poll_cycle_error();
+                    return Err(err);
+                }
+            };
         info!(poll_count = loop_state.poll_count, state = ?loop_state.state, result = ?cycle_result, "sync poll cycle complete");
 
         thread::sleep(poll_interval);
@@ -155,10 +163,13 @@ fn run_poll_cycle(
     let relay_tip = submitter.relay_tip_height()?;
     // Saturating to avoid underflow if relay ever reports ahead (misconfig/reorg edge).
     let lag = bitcoin_tip.saturating_sub(relay_tip);
+    metrics::set_tip_gauges(bitcoin_tip, relay_tip, lag);
+    refresh_wallet_balance_metrics(submitter);
 
     info!(trigger = ?trigger, bitcoin_tip, relay_tip, lag, "tip discovery");
 
     if relay_tip >= bitcoin_tip {
+        metrics::inc_sync_poll_up_to_date();
         info!(
             relay_tip,
             bitcoin_tip, "sync is up to date; nothing to submit this cycle"
@@ -193,7 +204,33 @@ fn run_poll_cycle(
         lag,
         "relay behind bitcoin tip: catch-up cycle finished"
     );
+    metrics::inc_sync_poll_progressed();
+    metrics::add_sync_headers_submitted(progress.submitted);
+    metrics::add_sync_retries(progress.retries);
     Ok(SyncResult::Progressed)
+}
+
+fn refresh_wallet_balance_metrics(submitter: &dyn BtcRelaySubmitter) {
+    let address = match submitter.relayer_wallet_address() {
+        Ok(v) => v,
+        Err(_) => return, // submitter backend does not expose wallet info
+    };
+    let wei = match submitter.relayer_wallet_balance_wei() {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "failed to refresh relayer wallet balance");
+            return;
+        }
+    };
+    let wei_f64 = wei.to_string().parse::<f64>().unwrap_or(0.0);
+    let eth = wei_f64 / 1_000_000_000_000_000_000_f64;
+    metrics::set_relayer_wallet_balance(wei_f64, eth);
+    info!(
+        wallet_address = %address,
+        wallet_balance_wei = %wei,
+        wallet_balance_eth = eth,
+        "relayer wallet balance snapshot"
+    );
 }
 
 /// Walk `from_height..=to_height` in batches; each successful batch persists JSON and logs tx hash.
@@ -634,14 +671,17 @@ fn resolve_resume_start_height(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_retry_decision, compute_catchup_range, process_catchup_range,
-        resolve_resume_start_height, RetryDecision,
+        backoff_delay_secs, build_submit_main_payload_hex_for_range, choose_submission_batch_size,
+        classify_retry_decision, compute_catchup_range, decode_even_hex, parse_timestamp_from_header,
+        process_catchup_range, process_submit_batch, resolve_resume_start_height, run_poll_cycle,
+        RetryDecision, SyncEngineState, SyncLoopState, SyncResult, SyncTrigger,
     };
     use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
     use crate::persistence::{JsonFileStateStore, RelayProgressState};
     use anyhow::Result;
     use std::cell::RefCell;
     use std::env;
+    use std::fs;
 
     #[test]
     fn catchup_range_uses_relay_tip_plus_one_when_no_start_override() {
@@ -828,6 +868,219 @@ mod tests {
             classify_retry_decision("failed to decode abi output"),
             RetryDecision::HardFailure
         );
+    }
+
+    #[test]
+    fn choose_submission_batch_size_switches_between_catchup_and_live_modes() {
+        assert_eq!(choose_submission_batch_size(20, 16, 2), 16);
+        assert_eq!(choose_submission_batch_size(2, 16, 2), 1);
+        assert_eq!(choose_submission_batch_size(100, 0, 2), 1);
+    }
+
+    #[test]
+    fn decode_even_hex_rejects_odd_and_non_hex_input() {
+        let odd = decode_even_hex("abc").expect_err("odd hex should fail");
+        assert!(odd.to_string().contains("even length"));
+
+        let non_hex = decode_even_hex("zz").expect_err("non-hex should fail");
+        assert!(non_hex.to_string().contains("non-hex"));
+    }
+
+    #[test]
+    fn parse_timestamp_from_header_requires_exact_header_length() {
+        let err = parse_timestamp_from_header(&[0_u8; 79]).expect_err("short header must fail");
+        assert!(err.to_string().contains("exactly 80 bytes"));
+    }
+
+    #[test]
+    fn backoff_delay_caps_exponential_growth() {
+        assert_eq!(backoff_delay_secs(1), 1);
+        assert_eq!(backoff_delay_secs(2), 2);
+        assert_eq!(backoff_delay_secs(3), 4);
+        assert_eq!(backoff_delay_secs(6), 32);
+        assert_eq!(backoff_delay_secs(12), 32);
+    }
+
+    #[test]
+    fn payload_build_fails_when_previous_header_is_not_80_bytes() {
+        struct BadPreviousHeaderBitcoinRpc;
+        impl BitcoinRpcClient for BadPreviousHeaderBitcoinRpc {
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(0)
+            }
+            fn get_block_hash(&self, height: u64) -> Result<String> {
+                Ok(format!("hash-{height}"))
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("best".to_string())
+            }
+            fn get_block_header_hex(&self, hash: &str) -> Result<String> {
+                let h = hash
+                    .strip_prefix("hash-")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if h == 10 {
+                    return Ok("00".repeat(79)); // 79 bytes instead of 80
+                }
+                Ok(fake_full_header_hex(h))
+            }
+        }
+        let bitcoin = BadPreviousHeaderBitcoinRpc;
+        let submitter = FakeSubmitter::new();
+        let err = build_submit_main_payload_hex_for_range(&bitcoin, &submitter, 11, 11)
+            .expect_err("previous header with invalid length should fail");
+        assert!(err
+            .to_string()
+            .contains("previous block header must be 80 bytes"));
+    }
+
+    #[test]
+    fn payload_build_fails_when_timestamp_window_header_is_malformed_hex() {
+        struct BadTimestampWindowBitcoinRpc;
+        impl BitcoinRpcClient for BadTimestampWindowBitcoinRpc {
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(0)
+            }
+            fn get_block_hash(&self, height: u64) -> Result<String> {
+                Ok(format!("hash-{height}"))
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("best".to_string())
+            }
+            fn get_block_header_hex(&self, hash: &str) -> Result<String> {
+                let h = hash
+                    .strip_prefix("hash-")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if h == 5 {
+                    return Ok("zz".to_string()); // invalid hex in timestamp window
+                }
+                Ok(fake_full_header_hex(h))
+            }
+        }
+        let bitcoin = BadTimestampWindowBitcoinRpc;
+        let submitter = FakeSubmitter::new();
+        let err = build_submit_main_payload_hex_for_range(&bitcoin, &submitter, 12, 12)
+            .expect_err("malformed timestamp-window header should fail");
+        assert!(err
+            .to_string()
+            .contains("failed decode header for timestamp height 5"));
+    }
+
+    #[test]
+    fn compute_catchup_range_rejects_start_above_tip() {
+        let err = compute_catchup_range(10, 12, 99).expect_err("start above tip must fail");
+        assert!(err.to_string().contains("computed catch-up start"));
+    }
+
+    #[test]
+    fn process_submit_batch_rejects_invalid_ranges() {
+        let bitcoin = FakeBitcoinRpc::new();
+        let submitter = FakeSubmitter::new();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+
+        let err_zero = process_submit_batch(&bitcoin, &submitter, 0, 1, &mut loop_state)
+            .expect_err("height 0 should fail");
+        assert!(err_zero.to_string().contains("cannot submit height 0"));
+
+        let err_reversed = process_submit_batch(&bitcoin, &submitter, 20, 19, &mut loop_state)
+            .expect_err("reversed range should fail");
+        assert!(err_reversed.to_string().contains("invalid batch range"));
+    }
+
+    #[test]
+    fn process_catchup_range_sets_error_state_on_hard_failure() {
+        struct HardFailSubmitter;
+        impl BtcRelaySubmitter for HardFailSubmitter {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(0)
+            }
+            fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+                Ok([0_u8; 32])
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                Ok("0x00".to_string())
+            }
+            fn submit_header(&self, _header_hex: &str) -> Result<String> {
+                anyhow::bail!("abi decode mismatch");
+            }
+        }
+
+        let bitcoin = FakeBitcoinRpc::new();
+        let submitter = HardFailSubmitter;
+        let state_store = test_state_store();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        let err = process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
+            .expect_err("hard failure should bubble");
+        assert!(err.to_string().contains("hard failure while processing range"));
+        assert_eq!(loop_state.state, SyncEngineState::Error);
+    }
+
+    #[test]
+    fn process_catchup_range_reports_state_persist_failure() {
+        let bitcoin = FakeBitcoinRpc::new();
+        let submitter = FakeSubmitter::new();
+        let mut bad_path = env::temp_dir();
+        bad_path.push(format!(
+            "btc-relay-sync-engine-dir-as-file-{}-{}",
+            std::process::id(),
+            current_test_timestamp()
+        ));
+        fs::create_dir_all(&bad_path).expect("create dir path");
+        let state_store = JsonFileStateStore::new(&bad_path);
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        let err = process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
+            .expect_err("persist failure should bubble");
+        assert!(err.to_string().contains("failed persisting relay state"));
+        let _ = fs::remove_dir_all(&bad_path);
+    }
+
+    #[test]
+    fn run_poll_cycle_returns_up_to_date_when_relay_is_ahead() {
+        struct UpToDateBitcoin;
+        impl BitcoinRpcClient for UpToDateBitcoin {
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(100)
+            }
+            fn get_block_hash(&self, _height: u64) -> Result<String> {
+                Ok("hash".to_string())
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("best".to_string())
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                Ok("00".repeat(80))
+            }
+        }
+        struct AheadSubmitter;
+        impl BtcRelaySubmitter for AheadSubmitter {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(120)
+            }
+            fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+                Ok([0_u8; 32])
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                Ok("0x00".to_string())
+            }
+            fn submit_header(&self, _header_hex: &str) -> Result<String> {
+                Ok("0xtx".to_string())
+            }
+        }
+
+        let bitcoin = UpToDateBitcoin;
+        let submitter = AheadSubmitter;
+        let state_store = test_state_store();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        let result = run_poll_cycle(
+            &bitcoin,
+            &submitter,
+            SyncTrigger::PollTick,
+            &mut loop_state,
+            &state_store,
+        )
+        .expect("poll cycle");
+        assert_eq!(result, SyncResult::UpToDate);
     }
 
     fn test_state_store() -> JsonFileStateStore {

@@ -42,6 +42,9 @@ pub struct AppConfig {
     pub evm_max_fee_gwei: Option<u64>,
     /// Optional `maxPriorityFeePerGas` in gwei.
     pub evm_priority_fee_gwei: Option<u64>,
+    #[serde(default = "default_evm_low_balance_txs_left_warn")]
+    /// Warn when estimated remaining tx count (at recent fee level) drops below this value.
+    pub evm_low_balance_txs_left_warn: u64,
     /// Sleep between sync loop iterations when we're caught up or idle.
     pub poll_interval_secs: u64,
     /// Bootstrap override: first height to consider when **no** JSON state file exists. After that, on-chain tip wins.
@@ -55,6 +58,9 @@ pub struct AppConfig {
     #[serde(default = "default_state_file_path")]
     /// Where we dump last-submitted height/hash JSON for operators (not the authority for resume — contract is).
     pub state_file_path: String,
+    #[serde(default = "default_metrics_bind_addr")]
+    /// Bind address for Prometheus scrape endpoint (`GET /metrics`).
+    pub metrics_bind_addr: String,
 }
 
 impl AppConfig {
@@ -118,6 +124,9 @@ impl AppConfig {
         if self.state_file_path.trim().is_empty() {
             anyhow::bail!("STATE_FILE_PATH must be non-empty");
         }
+        if self.metrics_bind_addr.trim().is_empty() {
+            anyhow::bail!("METRICS_BIND_ADDR must be non-empty");
+        }
 
         Ok(())
     }
@@ -143,6 +152,10 @@ fn default_evm_tx_timeout_secs() -> u64 {
     120 // receipt polling budget.
 }
 
+fn default_evm_low_balance_txs_left_warn() -> u64 {
+    50 // warning threshold for "how many txs left" at current observed fee.
+}
+
 fn default_state_file_path() -> String {
     "artifacts/relay-state.json".to_string()
 }
@@ -155,9 +168,143 @@ fn default_live_lag_threshold() -> u64 {
     2 // within this many blocks of tip → single-header txs.
 }
 
+fn default_metrics_bind_addr() -> String {
+    "0.0.0.0:9090".to_string()
+}
+
 /// Cheap `0x` + 20-byte hex check. Not checksum-validated — we're not doing UX here.
 fn is_valid_evm_address(value: &str) -> bool {
     value.len() == 42
         && value.starts_with("0x")
         && value.chars().skip(2).all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            bitcoin_rpc_url: "http://127.0.0.1:8332".to_string(),
+            bitcoin_rpc_user: "user".to_string(),
+            bitcoin_rpc_password: "pass".to_string(),
+            bitcoin_rpc_timeout_secs: 10,
+            bitcoin_ibd_poll_secs: 30,
+            evm_rpc_url: "http://127.0.0.1:8545".to_string(),
+            relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+            relayer_private_key: "0x01".to_string(),
+            evm_chain_id: 31337,
+            evm_tx_confirmations: 1,
+            evm_tx_timeout_secs: 120,
+            evm_max_fee_gwei: None,
+            evm_priority_fee_gwei: None,
+            evm_low_balance_txs_left_warn: 50,
+            poll_interval_secs: 5,
+            start_height: 0,
+            catchup_batch_size: 16,
+            live_lag_threshold: 2,
+            state_file_path: "artifacts/relay-state.json".to_string(),
+            metrics_bind_addr: "127.0.0.1:9090".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_config() {
+        valid_config().validate().expect("valid config should pass");
+    }
+
+    #[test]
+    fn validate_rejects_partial_bitcoin_auth_pair() {
+        let mut cfg = valid_config();
+        cfg.bitcoin_rpc_password.clear();
+        let err = cfg.validate().expect_err("expected auth pair error");
+        assert!(err.to_string().contains("must be both set or both empty"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_relay_address() {
+        let mut cfg = valid_config();
+        cfg.relay_contract_address = "0x1234".to_string();
+        let err = cfg.validate().expect_err("expected invalid address error");
+        assert!(err.to_string().contains("valid 0x-prefixed 20-byte hex address"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_chain_id() {
+        let mut cfg = valid_config();
+        cfg.evm_chain_id = 0;
+        let err = cfg.validate().expect_err("expected chain id error");
+        assert!(err.to_string().contains("EVM_CHAIN_ID must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_state_file_path() {
+        let mut cfg = valid_config();
+        cfg.state_file_path = "  ".to_string();
+        let err = cfg.validate().expect_err("expected state file path error");
+        assert!(err.to_string().contains("STATE_FILE_PATH must be non-empty"));
+    }
+
+    #[test]
+    fn validate_rejects_non_http_bitcoin_url() {
+        let mut cfg = valid_config();
+        cfg.bitcoin_rpc_url = "ftp://node".to_string();
+        let err = cfg.validate().expect_err("expected bitcoin url error");
+        assert!(err.to_string().contains("BITCOIN_RPC_URL must start with http/https"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_catchup_batch_size() {
+        let mut cfg = valid_config();
+        cfg.catchup_batch_size = 0;
+        let err = cfg.validate().expect_err("expected catchup batch size error");
+        assert!(err.to_string().contains("CATCHUP_BATCH_SIZE must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_non_http_evm_url() {
+        let mut cfg = valid_config();
+        cfg.evm_rpc_url = "ws://node".to_string();
+        let err = cfg.validate().expect_err("expected evm url error");
+        assert!(err.to_string().contains("EVM_RPC_URL must start with http/https"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_private_key() {
+        let mut cfg = valid_config();
+        cfg.relayer_private_key = "  ".to_string();
+        let err = cfg.validate().expect_err("expected private key error");
+        assert!(err.to_string().contains("RELAYER_PRIVATE_KEY is required"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_confirmations() {
+        let mut cfg = valid_config();
+        cfg.evm_tx_confirmations = 0;
+        let err = cfg.validate().expect_err("expected confirmations error");
+        assert!(err.to_string().contains("EVM_TX_CONFIRMATIONS must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_poll_interval() {
+        let mut cfg = valid_config();
+        cfg.poll_interval_secs = 0;
+        let err = cfg.validate().expect_err("expected poll interval error");
+        assert!(err.to_string().contains("POLL_INTERVAL_SECS must be > 0"));
+    }
+
+    #[test]
+    fn validate_accepts_zero_low_balance_warn_threshold() {
+        let mut cfg = valid_config();
+        cfg.evm_low_balance_txs_left_warn = 0;
+        cfg.validate().expect("zero threshold disables low-balance warnings");
+    }
+
+    #[test]
+    fn validate_rejects_empty_metrics_bind_addr() {
+        let mut cfg = valid_config();
+        cfg.metrics_bind_addr = " ".to_string();
+        let err = cfg.validate().expect_err("expected metrics bind addr error");
+        assert!(err.to_string().contains("METRICS_BIND_ADDR must be non-empty"));
+    }
 }
