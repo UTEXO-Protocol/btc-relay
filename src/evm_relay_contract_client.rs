@@ -20,12 +20,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 use alloy::sol;
 use alloy::sol_types::SolCall;
 
 use crate::configs::AppConfig;
 use crate::interfaces::BtcRelaySubmitter;
+use crate::metrics;
 
 /// `0x` + 64 hex nibbles = 32-byte keccak tx hash. Anything else is not a real `eth_sendRawTransaction` return.
 const EVM_TX_HASH_HEX_LEN: usize = 66;
@@ -62,6 +64,8 @@ pub struct EvmRelayContractClient {
     pub evm_max_fee_gwei: Option<u64>,
     /// If set, sets `maxPriorityFeePerGas` (gwei) for EIP-1559.
     pub evm_priority_fee_gwei: Option<u64>,
+    /// Warn when estimated txs left at current fee falls below this threshold.
+    pub evm_low_balance_txs_left_warn: u64,
     /// Transport boundary: keeps client logic testable without real RPC/provider setup.
     transport: Arc<dyn EvmTransport>,
 }
@@ -75,6 +79,11 @@ struct SendTxRequest {
     max_fee_gwei: Option<u64>,
     priority_fee_gwei: Option<u64>,
     calldata: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfirmationStats {
+    tx_fee_wei: Option<AlloyU256>,
 }
 
 trait EvmTransport: Send + Sync {
@@ -179,6 +188,7 @@ impl EvmRelayContractClient {
             evm_tx_timeout_secs: cfg.evm_tx_timeout_secs,
             evm_max_fee_gwei: cfg.evm_max_fee_gwei,
             evm_priority_fee_gwei: cfg.evm_priority_fee_gwei,
+            evm_low_balance_txs_left_warn: cfg.evm_low_balance_txs_left_warn,
             transport,
         }
     }
@@ -238,7 +248,7 @@ impl EvmRelayContractClient {
     }
 
     /// Poll `eth_getTransactionReceipt` + `eth_blockNumber` until enough confirmations or timeout. Revert = hard error.
-    fn wait_for_confirmation(&self, tx_hash: &str) -> Result<()> {
+    fn wait_for_confirmation(&self, tx_hash: &str) -> Result<ConfirmationStats> {
         if !is_valid_tx_hash(tx_hash) {
             anyhow::bail!(
                 "invalid tx hash format: expected 0x-prefixed 32-byte hash ({} chars)",
@@ -259,6 +269,10 @@ impl EvmRelayContractClient {
             #[serde(rename = "blockNumber")]
             /// Hex quantity string, e.g. `0x3b` — block that included this tx.
             block_number: Option<String>,
+            #[serde(rename = "gasUsed")]
+            gas_used: Option<String>,
+            #[serde(rename = "effectiveGasPrice")]
+            effective_gas_price: Option<String>,
         }
         // Receipt shape is minimal on purpose — we only need success bit + block number.
 
@@ -319,7 +333,20 @@ impl EvmRelayContractClient {
             // Inclusive depth: same block as head => 1 confirmation; one block later => 2; etc.
             let confirmations = head_num.saturating_sub(tx_block_num) + 1;
             if confirmations >= self.evm_tx_confirmations {
-                return Ok(());
+                let tx_fee_wei = match (
+                    receipt.gas_used.as_deref(),
+                    receipt.effective_gas_price.as_deref(),
+                ) {
+                    (Some(gas_used), Some(effective_gas_price)) => {
+                        let gas_used_u256 = parse_hex_quantity_u256(gas_used)
+                            .context("invalid receipt gasUsed format")?;
+                        let gas_price_u256 = parse_hex_quantity_u256(effective_gas_price)
+                            .context("invalid receipt effectiveGasPrice format")?;
+                        Some(gas_used_u256.saturating_mul(gas_price_u256))
+                    }
+                    _ => None,
+                };
+                return Ok(ConfirmationStats { tx_fee_wei });
             }
 
             thread::sleep(poll_interval);
@@ -379,6 +406,32 @@ impl EvmRelayContractClient {
             .to_string();
 
         hex_prefixed_to_bytes(&result).context("eth_call returned invalid hex result")
+    }
+
+    /// Relayer EOA derived from `RELAYER_PRIVATE_KEY` (used for tx signing and balance checks).
+    pub fn relayer_wallet_address(&self) -> Result<String> {
+        let wallet = self
+            .relayer_private_key
+            .parse::<LocalWallet>()
+            .context("invalid RELAYER_PRIVATE_KEY format")?;
+        Ok(format!("{:#x}", wallet.address()))
+    }
+
+    /// Current relayer wallet balance in wei (`eth_getBalance` at `latest`).
+    pub fn relayer_wallet_balance_wei(&self) -> Result<AlloyU256> {
+        let address = self.relayer_wallet_address()?;
+        let value = self
+            .transport
+            .rpc_request(
+                &self.evm_rpc_url,
+                "eth_getBalance",
+                json!([address, "latest"]),
+            )
+            .context("failed eth_getBalance")?
+            .as_str()
+            .context("eth_getBalance returned non-string result")?
+            .to_string();
+        parse_hex_quantity_u256(value.as_str()).context("invalid eth_getBalance format")
     }
 
 }
@@ -450,10 +503,61 @@ impl BtcRelaySubmitter for EvmRelayContractClient {
             .context("failed to send header submission transaction")?;
 
         // Only return once mined deep enough — sync loop assumes relay state reflects this tx.
-        self.wait_for_confirmation(&tx_hash)
+        let confirmation = self
+            .wait_for_confirmation(&tx_hash)
             .context("header submission transaction failed confirmation step")?;
+        if let Some(tx_fee_wei) = confirmation.tx_fee_wei {
+            let tx_fee_wei_f64 = tx_fee_wei.to_string().parse::<f64>().unwrap_or(0.0);
+            let tx_fee_eth = tx_fee_wei_f64 / 1_000_000_000_000_000_000_f64;
+            metrics::record_confirmed_tx_fee_wei(tx_fee_wei_f64);
+            match self.relayer_wallet_balance_wei() {
+                Ok(balance_wei) => {
+                    let balance_wei_f64 = balance_wei.to_string().parse::<f64>().unwrap_or(0.0);
+                    let balance_eth = balance_wei_f64 / 1_000_000_000_000_000_000_f64;
+                    let txs_left = if tx_fee_wei > AlloyU256::from(0_u8) {
+                        balance_wei / tx_fee_wei
+                    } else {
+                        AlloyU256::from(0_u8)
+                    };
+                    let txs_left_f64 = txs_left.to_string().parse::<f64>().unwrap_or(0.0);
+                    metrics::set_estimated_txs_left(txs_left_f64);
+                    info!(
+                        tx_hash = %tx_hash,
+                        tx_fee_wei = %tx_fee_wei,
+                        tx_fee_eth,
+                        wallet_balance_wei = %balance_wei,
+                        wallet_balance_eth = balance_eth,
+                        est_txs_left_at_current_fee = %txs_left,
+                        "header submission confirmed"
+                    );
+                    if self.evm_low_balance_txs_left_warn > 0
+                        && txs_left <= AlloyU256::from(self.evm_low_balance_txs_left_warn)
+                    {
+                        warn!(
+                            tx_hash = %tx_hash,
+                            est_txs_left_at_current_fee = %txs_left,
+                            threshold = self.evm_low_balance_txs_left_warn,
+                            wallet_balance_eth = balance_eth,
+                            tx_fee_eth,
+                            "relayer funds are running low"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(tx_hash = %tx_hash, error = %err, "failed reading relayer wallet balance after tx confirmation");
+                }
+            }
+        }
 
         Ok(tx_hash)
+    }
+
+    fn relayer_wallet_address(&self) -> Result<String> {
+        self.relayer_wallet_address()
+    }
+
+    fn relayer_wallet_balance_wei(&self) -> Result<AlloyU256> {
+        self.relayer_wallet_balance_wei()
     }
 }
 
@@ -477,6 +581,16 @@ fn parse_hex_quantity_u64(value: &str) -> Result<u64> {
         return Ok(0); // `0x` alone means zero per JSON-RPC examples
     }
     u64::from_str_radix(raw, 16).context("failed to parse hex quantity as u64")
+}
+
+fn parse_hex_quantity_u256(value: &str) -> Result<AlloyU256> {
+    let raw = value
+        .strip_prefix("0x")
+        .context("hex quantity must start with 0x")?;
+    if raw.is_empty() {
+        return Ok(AlloyU256::from(0_u8));
+    }
+    AlloyU256::from_str_radix(raw, 16).context("failed to parse hex quantity as u256")
 }
 
 /// Single ASCII hex digit → 0..15. Garbage in → `None`.
@@ -577,6 +691,7 @@ mod tests {
             evm_tx_timeout_secs: 10,
             evm_max_fee_gwei: None,
             evm_priority_fee_gwei: None,
+            evm_low_balance_txs_left_warn: 50,
             transport,
         }
     }

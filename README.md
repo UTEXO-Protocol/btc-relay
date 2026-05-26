@@ -82,7 +82,15 @@ Coverage gap to keep in mind:
 - Sync engine and payload builder are still dense and carry multiple responsibilities.
 - EVM client currently creates some dependencies inside methods (testability can be improved with injected abstractions).
 - Error classification for retries is string-based.
-- No production metrics/alerts layer yet (only logs).
+- Metrics are in place, but dashboards/alert thresholds still need environment tuning.
+
+## Monitoring
+
+- Metrics endpoint: `GET /metrics` on `METRICS_BIND_ADDR` (default `0.0.0.0:9090`)
+- Setup guide: `docs/monitoring.md`
+- Starter files:
+  - `monitoring/prometheus-alerts.yml`
+  - `monitoring/prometheus.yml`
 
 ## License
 

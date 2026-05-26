@@ -12,6 +12,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
+use crate::metrics;
 use crate::persistence::{JsonFileStateStore, RelayProgressState};
 
 /// Coarse FSM labels for logs / future metrics. Most transitions are `Active` ↔ `CatchingUp` in practice.
@@ -126,6 +127,7 @@ pub fn run_sync_loop(
 
     loop {
         loop_state.poll_count = loop_state.poll_count.saturating_add(1);
+        metrics::inc_sync_poll_cycle();
         let trigger = if loop_state.poll_count == 1 {
             SyncTrigger::Startup
         } else {
@@ -133,7 +135,13 @@ pub fn run_sync_loop(
         };
 
         let cycle_result =
-            run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store)?;
+            match run_poll_cycle(bitcoin, submitter, trigger, &mut loop_state, state_store) {
+                Ok(result) => result,
+                Err(err) => {
+                    metrics::inc_sync_poll_cycle_error();
+                    return Err(err);
+                }
+            };
         info!(poll_count = loop_state.poll_count, state = ?loop_state.state, result = ?cycle_result, "sync poll cycle complete");
 
         thread::sleep(poll_interval);
@@ -155,10 +163,13 @@ fn run_poll_cycle(
     let relay_tip = submitter.relay_tip_height()?;
     // Saturating to avoid underflow if relay ever reports ahead (misconfig/reorg edge).
     let lag = bitcoin_tip.saturating_sub(relay_tip);
+    metrics::set_tip_gauges(bitcoin_tip, relay_tip, lag);
+    refresh_wallet_balance_metrics(submitter);
 
     info!(trigger = ?trigger, bitcoin_tip, relay_tip, lag, "tip discovery");
 
     if relay_tip >= bitcoin_tip {
+        metrics::inc_sync_poll_up_to_date();
         info!(
             relay_tip,
             bitcoin_tip, "sync is up to date; nothing to submit this cycle"
@@ -193,7 +204,33 @@ fn run_poll_cycle(
         lag,
         "relay behind bitcoin tip: catch-up cycle finished"
     );
+    metrics::inc_sync_poll_progressed();
+    metrics::add_sync_headers_submitted(progress.submitted);
+    metrics::add_sync_retries(progress.retries);
     Ok(SyncResult::Progressed)
+}
+
+fn refresh_wallet_balance_metrics(submitter: &dyn BtcRelaySubmitter) {
+    let address = match submitter.relayer_wallet_address() {
+        Ok(v) => v,
+        Err(_) => return, // submitter backend does not expose wallet info
+    };
+    let wei = match submitter.relayer_wallet_balance_wei() {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, "failed to refresh relayer wallet balance");
+            return;
+        }
+    };
+    let wei_f64 = wei.to_string().parse::<f64>().unwrap_or(0.0);
+    let eth = wei_f64 / 1_000_000_000_000_000_000_f64;
+    metrics::set_relayer_wallet_balance(wei_f64, eth);
+    info!(
+        wallet_address = %address,
+        wallet_balance_wei = %wei,
+        wallet_balance_eth = eth,
+        "relayer wallet balance snapshot"
+    );
 }
 
 /// Walk `from_height..=to_height` in batches; each successful batch persists JSON and logs tx hash.
