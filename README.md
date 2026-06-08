@@ -59,6 +59,37 @@ Each module has a clear role (see `//!` headers in source). Not full onion archi
 2. Run daemon:
    - `cargo run`
 
+## Run In Docker
+
+1. Build image:
+   - `make build`
+2. Run with env file and persisted state:
+   - `make run`
+3. Follow logs:
+   - `make logs`
+
+Notes:
+
+- Container writes local checkpoint to `STATE_FILE_PATH` (default `/app/artifacts/relay-state.json`).
+- Metrics are exposed on `METRICS_BIND_ADDR` (default `0.0.0.0:9090` in container).
+- Use `--add-host=host.docker.internal:host-gateway` if your RPC endpoints run on host and you refer to `host.docker.internal`.
+- `make help` shows all available targets.
+- Shared defaults and image tag formulas live in `config.mk` (including `REGISTRY_HOST=ghcr.io/utexo-protocol`).
+- Image tags follow `IMAGE_UTEXO_BTC_RELAY_LATEST` / `IMAGE_UTEXO_BTC_RELAY_BACKUP` and support optional `ENVIRONMENT` suffix.
+
+## CI Docker Build/Push
+
+- Workflow: `.github/workflows/docker-build-push.yml`
+- Triggers:
+  - manual run (`workflow_dispatch`)
+  - push to `main`
+- Required secrets:
+  - `GHCR_USERNAME`
+  - `GHCR_TOKEN` (PAT with `write:packages`)
+- Publishes two tags to GHCR:
+  - `ghcr.io/utexo-protocol/btc-relayer:latest`
+  - `ghcr.io/utexo-protocol/btc-relayer:<YYYY-MM-DD>-<shortsha>`
+
 ## Test
 
 - Run unit tests:

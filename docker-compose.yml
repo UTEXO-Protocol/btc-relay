@@ -1,0 +1,12 @@
+services:
+  btc-relayer:
+    container_name: btc-relayer
+    image: ghcr.io/utexo-protocol/btc-relayer:latest
+    pull_policy: never
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./artifacts:/app/artifacts
