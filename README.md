@@ -83,9 +83,8 @@ Notes:
 - Triggers:
   - manual run (`workflow_dispatch`)
   - push to `main`
-- Required secrets:
-  - `GHCR_USERNAME`
-  - `GHCR_TOKEN` (PAT with `write:packages`)
+- Auth:
+  - uses built-in `GITHUB_TOKEN` (no custom GHCR secrets required)
 - Publishes two tags to GHCR:
   - `ghcr.io/utexo-protocol/btc-relayer:latest`
   - `ghcr.io/utexo-protocol/btc-relayer:<YYYY-MM-DD>-<shortsha>`
