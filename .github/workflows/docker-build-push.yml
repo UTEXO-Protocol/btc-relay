@@ -1,0 +1,49 @@
+name: Docker Build And Push
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          CURRENT_DATE_TIME="$(date +'%Y-%m-%d')"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          IMAGE_REPO="ghcr.io/utexo-protocol/btc-relayer"
+          echo "latest=${IMAGE_REPO}:latest" >> "$GITHUB_OUTPUT"
+          echo "backup=${IMAGE_REPO}:${CURRENT_DATE_TIME}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.latest }}
+            ${{ steps.tags.outputs.backup }}
