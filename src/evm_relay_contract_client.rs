@@ -91,17 +91,28 @@ trait EvmTransport: Send + Sync {
     fn send_transaction(&self, request: SendTxRequest) -> Result<String>;
 }
 
+/// JSON-RPC allows `"result": null` (e.g. pending `eth_getTransactionReceipt`).
+/// That is distinct from a response that omits `result` entirely.
+fn parse_json_rpc_response(response: Value, method: &str) -> Result<Value> {
+    if response
+        .get("error")
+        .is_some_and(|err| !err.is_null())
+    {
+        let err = response.get("error").expect("checked above");
+        anyhow::bail!("{} returned error: {}", method, err);
+    }
+
+    response
+        .get("result")
+        .cloned()
+        .with_context(|| format!("{} response missing result field", method))
+}
+
 #[derive(Default)]
 struct HttpEvmTransport;
 
 impl EvmTransport for HttpEvmTransport {
     fn rpc_request(&self, rpc_url: &str, method: &str, params: Value) -> Result<Value> {
-        #[derive(Debug, Deserialize)]
-        struct JsonRpcResponse {
-            result: Option<Value>,
-            error: Option<Value>,
-        }
-
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -109,7 +120,7 @@ impl EvmTransport for HttpEvmTransport {
             "params": params,
         });
 
-        let response: JsonRpcResponse = reqwest::blocking::Client::new()
+        let response: Value = reqwest::blocking::Client::new()
             .post(rpc_url)
             .json(&request)
             .send()
@@ -117,13 +128,7 @@ impl EvmTransport for HttpEvmTransport {
             .json()
             .with_context(|| format!("{} response decode failed", method))?;
 
-        if let Some(err) = response.error {
-            anyhow::bail!("{} returned error: {}", method, err);
-        }
-
-        response
-            .result
-            .with_context(|| format!("{} response missing result field", method))
+        parse_json_rpc_response(response, method)
     }
 
     fn send_transaction(&self, request: SendTxRequest) -> Result<String> {
@@ -1142,5 +1147,67 @@ mod tests {
             )
             .expect_err("bad head format should fail");
         assert!(err.to_string().contains("invalid eth_blockNumber format"));
+    }
+
+    #[test]
+    fn parse_json_rpc_response_accepts_null_result() {
+        let body = json!({"jsonrpc":"2.0","id":1,"result":null});
+        let result = parse_json_rpc_response(body, "eth_getTransactionReceipt")
+            .expect("null result is valid JSON-RPC");
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn parse_json_rpc_response_rejects_missing_result_field() {
+        let body = json!({"jsonrpc":"2.0","id":1});
+        let err = parse_json_rpc_response(body, "eth_getTransactionReceipt")
+            .expect_err("missing result should fail");
+        assert!(err.to_string().contains("missing result field"));
+    }
+
+    #[test]
+    fn parse_json_rpc_response_surfaces_rpc_error() {
+        let body = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "error":{"code":-32000,"message":"rate limited"}
+        });
+        let err = parse_json_rpc_response(body, "eth_getTransactionReceipt")
+            .expect_err("rpc error should fail");
+        assert!(err.to_string().contains("returned error"));
+    }
+
+    #[test]
+    fn http_transport_preserves_null_json_rpc_result_for_pending_receipt() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind mock rpc");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("mock rpc bound address")
+            .port();
+
+        let server_thread = thread::spawn(move || {
+            let request = server.recv().expect("mock rpc request");
+            let response = tiny_http::Response::from_string(
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            )
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("content-type header"),
+            );
+            request.respond(response).expect("mock rpc response");
+        });
+
+        let transport = HttpEvmTransport;
+        let result = transport
+            .rpc_request(
+                &format!("http://127.0.0.1:{port}"),
+                "eth_getTransactionReceipt",
+                json!(["0x89c0666fac899083fdf5442b920271f647b8c000c000db839e817bb4673e1a48"]),
+            )
+            .expect("pending receipt null result should not error");
+        assert!(result.is_null());
+
+        server_thread.join().expect("mock rpc thread");
     }
 }
