@@ -52,7 +52,7 @@ pub enum SyncResult {
 
 /// Retry vs abort is decided by substring heuristics on the error string (RPC errors are not typed consistently).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryDecision {
+pub(crate) enum RetryDecision {
     Retryable,
     HardFailure,
 }
@@ -756,7 +756,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 /// Maps error text to retry vs fatal; keep markers aligned with real RPC failure strings you see in production.
-fn classify_retry_decision(err_message: &str) -> RetryDecision {
+pub(crate) fn classify_retry_decision(err_message: &str) -> RetryDecision {
     let msg = err_message.to_ascii_lowercase();
     let retryable_markers = [
         "timeout",

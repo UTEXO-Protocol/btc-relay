@@ -3,18 +3,17 @@
 
 //! HTTP/JSON-RPC client for the **on-chain BTCRelay contract** (reads via `eth_call`, writes via signed txs).
 //!
-//! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.
+//! Implementation detail: encode relay ABI, sign and send with `alloy`, poll receipts with bare JSON-RPC.
 //! Main sync uses `submitMainBlockheaders`; a Bitcoin reorg uses `submitShortForkBlockheaders` or `submitForkBlockheaders`.
 
-use alloy::primitives::U256 as AlloyU256;
+use alloy::consensus::{SignableTransaction, TxEnvelope, TypedTransaction};
+use alloy::eips::eip2718::Encodable2718;
+use alloy::network::TxSignerSync;
+use alloy::primitives::{Address, TxKind, U128, U256 as AlloyU256, U64};
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use ethers::middleware::SignerMiddleware;
-use ethers::providers::{Http, Middleware, Provider};
-use ethers::signers::{LocalWallet, Signer};
-use ethers::types::{
-    transaction::eip2718::TypedTransaction, Address, Bytes, Eip1559TransactionRequest,
-    NameOrAddress, U256 as EthersU256,
-};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -31,6 +30,12 @@ use crate::metrics;
 
 /// `0x` + 64 hex nibbles = 32-byte keccak tx hash. Anything else is not a real `eth_sendRawTransaction` return.
 const EVM_TX_HASH_HEX_LEN: usize = 66;
+
+/// Chain ids without EIP-1559. These chains get a legacy tx, as in ethers 2.0.14.
+const LEGACY_CHAIN_IDS: [u64; 25] = [
+    20, 30, 56, 69, 88, 97, 250, 280, 288, 324, 1088, 1101, 1442, 4002, 5000, 5001, 26863, 42220,
+    42261, 42262, 44787, 62320, 421611, 534351, 534352,
+];
 
 // `IBtcRelayView`: alloy `sol!` view of the on-chain BTCRelay ABI we call (historical name; contract is BTCRelay).
 // Must match deployed bytecode.
@@ -60,7 +65,7 @@ pub struct EvmRelayContractClient {
     pub evm_tx_confirmations: u64,
     /// Hard stop for receipt polling so we don't loop until heat death.
     pub evm_tx_timeout_secs: u64,
-    /// If set, caps `maxFeePerGas` (gwei). If `None`, ethers/node fills it in.
+    /// If set, caps `maxFeePerGas` (gwei). If `None`, the client estimates it from the node.
     pub evm_max_fee_gwei: Option<u64>,
     /// If set, sets `maxPriorityFeePerGas` (gwei) for EIP-1559.
     pub evm_priority_fee_gwei: Option<u64>,
@@ -135,42 +140,185 @@ impl EvmTransport for HttpEvmTransport {
             .context("failed to initialize tokio runtime for evm tx send")?;
 
         runtime.block_on(async move {
-            let provider = Provider::<Http>::try_from(request.rpc_url.as_str())
+            let url = request
+                .rpc_url
+                .parse()
                 .context("failed to create EVM provider")?;
-            let wallet = request
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(url);
+            let signer = request
                 .private_key
-                .parse::<LocalWallet>()
-                .context("invalid RELAYER_PRIVATE_KEY format")?
-                .with_chain_id(request.chain_id);
-            let client = SignerMiddleware::new(provider, wallet);
-
+                .parse::<PrivateKeySigner>()
+                .context("invalid RELAYER_PRIVATE_KEY format")?;
             let to = request
                 .relay_contract_address
                 .parse::<Address>()
                 .context("invalid RELAY_CONTRACT_ADDRESS")?;
-            let mut req = Eip1559TransactionRequest {
-                to: Some(NameOrAddress::Address(to)),
-                data: Some(Bytes::from(request.calldata)),
-                chain_id: Some(request.chain_id.into()),
-                ..Default::default()
-            };
-            if let Some(max_fee) = request.max_fee_gwei {
-                req.max_fee_per_gas =
-                    Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
-            }
-            if let Some(priority_fee) = request.priority_fee_gwei {
-                req.max_priority_fee_per_gas =
-                    Some(EthersU256::from(priority_fee) * EthersU256::from(1_000_000_000_u64));
-            }
-            let tx: TypedTransaction = req.into();
+            let gwei = |fee: Option<u64>| fee.map(|fee| u128::from(fee) * 1_000_000_000);
+            let (max_fee, priority_fee) =
+                (gwei(request.max_fee_gwei), gwei(request.priority_fee_gwei));
 
-            let pending = client
-                .send_transaction(tx, None)
-                .await
-                .context("eth_sendRawTransaction failed")?;
-            Ok::<String, anyhow::Error>(format!("{:#x}", pending.tx_hash()))
+            #[derive(Debug, Deserialize)]
+            struct LatestBlock {
+                #[serde(rename = "baseFeePerGas")]
+                base_fee_per_gas: Option<U128>,
+            }
+            #[derive(Debug, Deserialize)]
+            struct FeeHistory {
+                #[serde(default)]
+                reward: Vec<Vec<U128>>,
+            }
+
+            // The RPC calls, their params and the fee rules are those of ethers 2.0.14.
+            let send = async move {
+                let from = format!("{:#x}", signer.address());
+                let nonce = provider
+                    .raw_request::<_, U64>("eth_getTransactionCount".into(), (&from, "latest"))
+                    .await?
+                    .to::<u64>();
+                let mut call = json!({
+                    "from": from,
+                    "to": format!("{to:#x}"),
+                    "nonce": format!("{nonce:#x}"),
+                    "data": bytes_to_prefixed_hex(&request.calldata),
+                });
+
+                let (fee, priority_fee) = if LEGACY_CHAIN_IDS.contains(&request.chain_id) {
+                    let gas_price = match max_fee {
+                        Some(fee) => fee,
+                        None => provider
+                            .raw_request::<_, U128>("eth_gasPrice".into(), ())
+                            .await?
+                            .to::<u128>(),
+                    };
+                    call["gasPrice"] = json!(format!("{gas_price:#x}"));
+                    call["type"] = json!("0x00");
+                    (gas_price, None)
+                } else {
+                    let (max_fee, priority_fee) = match (max_fee, priority_fee) {
+                        (Some(max_fee), Some(priority_fee)) => (max_fee, priority_fee),
+                        _ => {
+                            let base_fee = provider
+                                .raw_request::<_, Option<LatestBlock>>(
+                                    "eth_getBlockByNumber".into(),
+                                    ("latest", false),
+                                )
+                                .await?
+                                .context("Latest block not found")?
+                                .base_fee_per_gas
+                                .context("EIP-1559 not activated")?
+                                .to::<u128>();
+                            // Old nodes take the block count as an integer.
+                            let percentiles = [5.0_f64];
+                            let history = match provider
+                                .raw_request::<_, FeeHistory>(
+                                    "eth_feeHistory".into(),
+                                    ("0xa", "latest", percentiles),
+                                )
+                                .await
+                            {
+                                Ok(history) => history,
+                                Err(err) => provider
+                                    .raw_request::<_, FeeHistory>(
+                                        "eth_feeHistory".into(),
+                                        (10, "latest", percentiles),
+                                    )
+                                    .await
+                                    .map_err(|_| err)?,
+                            };
+                            let rewards = history
+                                .reward
+                                .iter()
+                                .filter_map(|block| block.first())
+                                .map(|reward| reward.to::<u128>())
+                                .collect();
+                            let (est_max_fee, est_priority_fee) =
+                                eip1559_default_fees(base_fee, rewards);
+                            let max_fee = max_fee.unwrap_or(est_max_fee);
+                            // Only a configured tip is capped at the max fee.
+                            let priority_fee =
+                                priority_fee.map_or(est_priority_fee, |fee| fee.min(max_fee));
+                            (max_fee, priority_fee)
+                        }
+                    };
+                    call["accessList"] = json!([]);
+                    call["maxFeePerGas"] = json!(format!("{max_fee:#x}"));
+                    call["maxPriorityFeePerGas"] = json!(format!("{priority_fee:#x}"));
+                    call["type"] = json!("0x02");
+                    (max_fee, Some(priority_fee))
+                };
+
+                // No block tag: some nodes reject it.
+                let gas_limit = provider
+                    .raw_request::<_, U64>("eth_estimateGas".into(), (call,))
+                    .await?
+                    .to::<u64>();
+
+                let mut tx: TypedTransaction = TransactionRequest {
+                    chain_id: Some(request.chain_id),
+                    nonce: Some(nonce),
+                    gas: Some(gas_limit),
+                    to: Some(TxKind::Call(to)),
+                    input: request.calldata.into(),
+                    gas_price: priority_fee.is_none().then_some(fee),
+                    max_fee_per_gas: priority_fee.is_some().then_some(fee),
+                    max_priority_fee_per_gas: priority_fee,
+                    ..Default::default()
+                }
+                .build_consensus_tx()
+                .map_err(|err| anyhow::anyhow!("failed to build transaction: {}", err.error))?;
+                let signature = signer.sign_transaction_sync(&mut tx)?;
+                let raw = TxEnvelope::from(tx.into_signed(signature)).encoded_2718();
+                let pending = provider.send_raw_transaction(&raw).await?;
+                Ok::<String, anyhow::Error>(format!("{:#x}", pending.tx_hash()))
+            };
+            send.await.context("eth_sendRawTransaction failed")
         })
     }
+}
+
+/// Default EIP-1559 estimate of ethers 2.0.14. Returns `(max fee, priority fee)` in wei.
+fn eip1559_default_fees(base_fee: u128, rewards: Vec<u128>) -> (u128, u128) {
+    const DEFAULT_PRIORITY_FEE: u128 = 3_000_000_000;
+    let priority_fee = if base_fee < 100_000_000_000 {
+        DEFAULT_PRIORITY_FEE
+    } else {
+        // Median of the nonzero rewards. A jump of 200% or more in the upper half drops the lower values.
+        let mut rewards: Vec<u128> = rewards.into_iter().filter(|r| *r > 0).collect();
+        rewards.sort();
+        let changes: Vec<u128> = rewards
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]) * 100 / pair[0])
+            .collect();
+        let mut values = &rewards[..];
+        if let Some(max_change) = changes.iter().max() {
+            let index = changes
+                .iter()
+                .position(|change| change == max_change)
+                .expect("max is in changes");
+            if *max_change >= 200 && index >= rewards.len() / 2 {
+                values = &rewards[index..];
+            }
+        }
+        let estimate = values.get(values.len() / 2).copied().unwrap_or(0);
+        estimate.max(DEFAULT_PRIORITY_FEE)
+    };
+    let surged = if base_fee <= 40_000_000_000 {
+        base_fee * 2
+    } else if base_fee <= 100_000_000_000 {
+        base_fee * 16 / 10
+    } else if base_fee <= 200_000_000_000 {
+        base_fee * 14 / 10
+    } else {
+        base_fee * 12 / 10
+    };
+    let max_fee = if priority_fee > surged {
+        priority_fee + surged
+    } else {
+        surged
+    };
+    (max_fee, priority_fee)
 }
 
 #[allow(dead_code)]
@@ -470,11 +618,11 @@ impl EvmRelayContractClient {
 
     /// Relayer EOA derived from `RELAYER_PRIVATE_KEY` (used for tx signing and balance checks).
     pub fn relayer_wallet_address(&self) -> Result<String> {
-        let wallet = self
+        let signer = self
             .relayer_private_key
-            .parse::<LocalWallet>()
+            .parse::<PrivateKeySigner>()
             .context("invalid RELAYER_PRIVATE_KEY format")?;
-        Ok(format!("{:#x}", wallet.address()))
+        Ok(format!("{:#x}", signer.address()))
     }
 
     /// Current relayer wallet balance in wei (`eth_getBalance` at `latest`).
@@ -650,6 +798,9 @@ fn hex_prefixed_to_bytes(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_engine::{classify_retry_decision, RetryDecision};
+    use alloy::consensus::{Transaction as _, TxEnvelope};
+    use alloy::eips::eip2718::Decodable2718;
     use alloy::primitives::keccak256;
     use std::sync::Mutex;
 
@@ -720,6 +871,436 @@ mod tests {
             evm_priority_fee_gwei: None,
             evm_low_balance_txs_left_warn: 50,
             transport,
+        }
+    }
+
+    const STUB_KEY: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const STUB_TX_HASH: &str = "0xabababababababababababababababababababababababababababababababab";
+    const STUB_CONTRACT: &str = "0x1111111111111111111111111111111111111111";
+
+    type StubAnswer = Result<Value, Value>;
+
+    /// Local JSON-RPC server. It records each `(method, params)` and answers with `handler`.
+    struct RpcStub {
+        url: String,
+        log: Arc<Mutex<Vec<(String, Value)>>>,
+        server: Arc<tiny_http::Server>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RpcStub {
+        fn start(handler: impl Fn(&str, &Value) -> StubAnswer + Send + 'static) -> Self {
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind rpc stub"));
+            let port = server.server_addr().to_ip().expect("stub address").port();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let (srv, calls) = (server.clone(), log.clone());
+            let thread = thread::spawn(move || {
+                for mut request in srv.incoming_requests() {
+                    let mut body = String::new();
+                    std::io::Read::read_to_string(request.as_reader(), &mut body)
+                        .expect("read stub request");
+                    let call: Value = serde_json::from_str(&body).expect("stub request json");
+                    let method = call["method"].as_str().unwrap_or_default().to_string();
+                    let params = call["params"].clone();
+                    calls
+                        .lock()
+                        .expect("stub log")
+                        .push((method.clone(), params.clone()));
+                    let mut reply = json!({"jsonrpc": "2.0", "id": call["id"]});
+                    match handler(&method, &params) {
+                        Ok(result) => reply["result"] = result,
+                        Err(error) => reply["error"] = error,
+                    }
+                    let response = tiny_http::Response::from_string(reply.to_string()).with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"application/json"[..],
+                        )
+                        .expect("content-type header"),
+                    );
+                    let _ = request.respond(response);
+                }
+            });
+            Self {
+                url: format!("http://127.0.0.1:{port}"),
+                log,
+                server,
+                thread: Some(thread),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.log.lock().expect("stub log").clone()
+        }
+
+        fn raw_txs(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|(method, _)| method == "eth_sendRawTransaction")
+                .map(|(_, params)| params[0].as_str().expect("raw tx hex").to_string())
+                .collect()
+        }
+    }
+
+    impl Drop for RpcStub {
+        fn drop(&mut self) {
+            self.server.unblock();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A node with base fee 1 gwei, gas price 10 gwei, nonce 7 and a mined receipt.
+    fn node_answer(method: &str, _params: &Value) -> StubAnswer {
+        match method {
+            "eth_getTransactionCount" => Ok(json!("0x7")),
+            "eth_getBlockByNumber" => Ok(json!({"number": "0x10", "baseFeePerGas": "0x3b9aca00"})),
+            "eth_feeHistory" => Ok(json!({
+                "oldestBlock": "0x7",
+                "baseFeePerGas": ["0x3b9aca00", "0x3b9aca00"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x77359400"]]
+            })),
+            "eth_gasPrice" => Ok(json!("0x2540be400")),
+            "eth_estimateGas" => Ok(json!("0x1e8480")),
+            "eth_sendRawTransaction" => Ok(json!(STUB_TX_HASH)),
+            "eth_getTransactionReceipt" => Ok(json!({"status": "0x1", "blockNumber": "0x10"})),
+            "eth_blockNumber" => Ok(json!("0x10")),
+            _ => Err(json!({"code": -32601, "message": "method not found"})),
+        }
+    }
+
+    fn stub_send_request(
+        url: &str,
+        chain_id: u64,
+        max_fee_gwei: Option<u64>,
+        priority_fee_gwei: Option<u64>,
+    ) -> SendTxRequest {
+        SendTxRequest {
+            rpc_url: url.to_string(),
+            private_key: STUB_KEY.to_string(),
+            relay_contract_address: STUB_CONTRACT.to_string(),
+            chain_id,
+            max_fee_gwei,
+            priority_fee_gwei,
+            calldata: vec![0xde, 0xad, 0xbe, 0xef],
+        }
+    }
+
+    fn stub_relay_client(url: &str) -> EvmRelayContractClient {
+        let mut client = test_relay_client_with_transport(Arc::new(HttpEvmTransport));
+        client.evm_rpc_url = url.to_string();
+        client.relayer_private_key = STUB_KEY.to_string();
+        client
+    }
+
+    /// `Error(string)` ABI encoding of `block commitment`.
+    const BLOCK_COMMITMENT_REVERT_DATA: &str = concat!(
+        "0x08c379a0",
+        "0000000000000000000000000000000000000000000000000000000000000020",
+        "0000000000000000000000000000000000000000000000000000000000000010",
+        "626c6f636b20636f6d6d69746d656e7400000000000000000000000000000000"
+    );
+
+    fn decode_raw_tx(raw_hex: &str) -> TxEnvelope {
+        let raw = hex_prefixed_to_bytes(raw_hex).expect("raw tx hex");
+        TxEnvelope::decode_2718(&mut raw.as_slice()).expect("decode raw tx")
+    }
+
+    #[test]
+    fn submit_calls_put_pinned_calldata_on_the_wire() {
+        let headers_tail = concat!(
+            "0000000000000000000000000000000000000000000000000000000000000050",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "1111111111111111111111111111111100000000000000000000000000000000"
+        );
+        let offset_32 = "0000000000000000000000000000000000000000000000000000000000000020";
+        let fork_7 = concat!(
+            "0000000000000000000000000000000000000000000000000000000000000007",
+            "0000000000000000000000000000000000000000000000000000000000000040"
+        );
+        let expected = [
+            format!("0x59533237{offset_32}{headers_tail}"),
+            format!("0x98c650d5{offset_32}{headers_tail}"),
+            format!("0x2bb52aad{fork_7}{headers_tail}"),
+        ];
+
+        let stub = RpcStub::start(node_answer);
+        let client = stub_relay_client(&stub.url);
+        let headers = "11".repeat(80);
+        client.submit_header(&headers).expect("submit main");
+        client
+            .submit_short_fork(&headers)
+            .expect("submit short fork");
+        client.submit_fork(7, &headers).expect("submit fork");
+
+        let estimated: Vec<String> = stub
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == "eth_estimateGas")
+            .map(|(_, params)| params[0]["data"].as_str().expect("data").to_string())
+            .collect();
+        let sent: Vec<String> = stub
+            .raw_txs()
+            .iter()
+            .map(|raw| bytes_to_prefixed_hex(decode_raw_tx(raw).input()))
+            .collect();
+        assert_eq!(estimated, expected);
+        assert_eq!(sent, expected);
+    }
+
+    #[test]
+    fn ethers_fee_estimator_port_matches_vectors() {
+        const GWEI: u128 = 1_000_000_000;
+        // Base fee below 100 gwei: default tip, surged base fee.
+        assert_eq!(
+            eip1559_default_fees(100 * GWEI - 1, vec![]),
+            (159_999_999_998, 3 * GWEI)
+        );
+        // Base fee above 100 gwei: median reward.
+        assert_eq!(
+            eip1559_default_fees(100 * GWEI + 1, vec![100 * GWEI, 105 * GWEI, 102 * GWEI]),
+            (140_000_000_001, 102 * GWEI)
+        );
+        // Rewards above u32 do not overflow.
+        let large = u128::from(u32::MAX) + 1;
+        assert_eq!(
+            eip1559_default_fees(200 * GWEI + 1, vec![large, large]),
+            (240_000_000_001, large)
+        );
+        // A jump of 200% in the upper half drops the lower rewards.
+        assert_eq!(
+            eip1559_default_fees(100 * GWEI, vec![GWEI, GWEI, GWEI, 4 * GWEI, 4 * GWEI]),
+            (160 * GWEI, 4 * GWEI)
+        );
+    }
+
+    #[test]
+    fn relayer_wallet_address_matches_key() {
+        let mut client = test_relay_client();
+        client.relayer_private_key = STUB_KEY.to_string();
+        assert_eq!(
+            client.relayer_wallet_address().expect("address"),
+            "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+
+        client.relayer_private_key = "0x01".to_string();
+        let err = client.relayer_wallet_address().expect_err("short key");
+        assert!(err
+            .to_string()
+            .contains("invalid RELAYER_PRIVATE_KEY format"));
+    }
+
+    #[test]
+    fn http_transport_sends_signed_tx() {
+        const SENDER: &str = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+        const GWEI: u128 = 1_000_000_000;
+        let nonce = json!(["eth_getTransactionCount", [SENDER, "latest"]]);
+        let block = json!(["eth_getBlockByNumber", ["latest", false]]);
+        let history = json!(["eth_feeHistory", ["0xa", "latest", [5.0]]]);
+        let estimate = |fees: Value| {
+            let mut tx =
+                json!({"data": "0xdeadbeef", "from": SENDER, "nonce": "0x7", "to": STUB_CONTRACT});
+            for (key, value) in fees.as_object().expect("fee fields") {
+                tx[key] = value.clone();
+            }
+            json!(["eth_estimateGas", [tx]])
+        };
+        let eip1559 = |max: &str, tip: &str| {
+            estimate(
+                json!({"accessList": [], "maxFeePerGas": max, "maxPriorityFeePerGas": tip, "type": "0x02"}),
+            )
+        };
+        let legacy = |price: &str| estimate(json!({"gasPrice": price, "type": "0x00"}));
+        let send = |raw: &str| json!(["eth_sendRawTransaction", [raw]]);
+
+        // (chain id, max fee, tip, fee history fails, calls, max fee or gas price, tip)
+        let rows = vec![
+            (421614, Some(30), Some(2), false, vec![
+                nonce.clone(),
+                eip1559("0x6fc23ac00", "0x77359400"),
+                send("0x02f87383066eee0784773594008506fc23ac00831e84809411111111111111111111111111111111111111118084deadbeefc001a0e4a8ff81ea96e10cd51d6f8b6a6a3ea5d2ca229df4f125cb2ebcaea43b6e74f4a0778fe5e166f022ca691187d5b02a53c20b94f8939d2d53fcc07f49ac7ef38862"),
+            ], 30 * GWEI, Some(2 * GWEI)),
+            (421614, Some(1), Some(2), false, vec![
+                nonce.clone(),
+                eip1559("0x3b9aca00", "0x77359400"),
+                send("0x02f87283066eee078477359400843b9aca00831e84809411111111111111111111111111111111111111118084deadbeefc001a0460100f9fe49b6611288c1121a22d0a064d4a564f07ac8bc7490135af539d415a01b6f0532f6f606f9c982264ee4c7f582762c1647c980b6becce88a95a54d4cb5"),
+            ], GWEI, Some(2 * GWEI)),
+            (421614, None, Some(50), false, vec![
+                nonce.clone(),
+                block.clone(),
+                history.clone(),
+                eip1559("0x12a05f200", "0x12a05f200"),
+                send("0x02f87483066eee0785012a05f20085012a05f200831e84809411111111111111111111111111111111111111118084deadbeefc080a01c547ef7d34647e1ecc96fc0a500d217cc24d425b65c16a3c0b6349e39a79671a02b3f3c8cafda61892914e5144f7c14afa07795c916eb697e663e0065f0ad7c6c"),
+            ], 5 * GWEI, Some(5 * GWEI)),
+            (421614, None, Some(1), false, vec![
+                nonce.clone(),
+                block.clone(),
+                history.clone(),
+                eip1559("0x12a05f200", "0x3b9aca00"),
+                send("0x02f87383066eee07843b9aca0085012a05f200831e84809411111111111111111111111111111111111111118084deadbeefc001a0c0d620855b110589045b635353098cdaa5d1a53ccbef1b8fc25042b8c82c1cf1a060c468129298562fb4daffcd4f0138e4af9a8bdbc141d7f7d9ab197d2dd26abf"),
+            ], 5 * GWEI, Some(GWEI)),
+            (421614, Some(4), None, false, vec![
+                nonce.clone(),
+                block.clone(),
+                history.clone(),
+                eip1559("0xee6b2800", "0xb2d05e00"),
+                send("0x02f87283066eee0784b2d05e0084ee6b2800831e84809411111111111111111111111111111111111111118084deadbeefc080a01c0a5baba98cbbbf025050dba620f4e6667c1d9e5879362dad2b1cd61b49f1eca05c9cb3cec88e734c559425ba556c4ece7f463274807e941cbdc0c18c95975ae6"),
+            ], 4 * GWEI, Some(3 * GWEI)),
+            (31337, None, None, false, vec![
+                nonce.clone(),
+                block.clone(),
+                history.clone(),
+                eip1559("0x12a05f200", "0xb2d05e00"),
+                send("0x02f872827a690784b2d05e0085012a05f200831e84809411111111111111111111111111111111111111118084deadbeefc001a0fe813dc5f8e3b0c4742d56149c77bdd2bafb67a4c5237cd2597e00ba7c05cf7ba012b31c7cf1a69f22f3702481c8fb48e7086f260f642c17bc48ed3fc93d426e1a"),
+            ], 5 * GWEI, Some(3 * GWEI)),
+            (421614, None, None, true, vec![
+                nonce.clone(),
+                block.clone(),
+                history.clone(),
+                json!(["eth_feeHistory", [10, "latest", [5.0]]]),
+                eip1559("0x12a05f200", "0xb2d05e00"),
+                send("0x02f87383066eee0784b2d05e0085012a05f200831e84809411111111111111111111111111111111111111118084deadbeefc001a095f3f63e29a1296383f233f2f9144fccc11e81477638f358c10e7d8b4b7271d4a0787c0cca9dd2cc4071f4f279f8c3684052366ac220ca1a6735a12702ef4d58b6"),
+            ], 5 * GWEI, Some(3 * GWEI)),
+            (56, Some(5), Some(2), false, vec![
+                nonce.clone(),
+                legacy("0x12a05f200"),
+                send("0xf86a0785012a05f200831e84809411111111111111111111111111111111111111118084deadbeef8193a03ece024368986b63533bae9fd8e90360d2062c1558f1c6ba94bba4c972fc930aa06d5700d0ea78715429b76a84ff83a2fdc89cb94f61af99a7362cd26b56e85b3e"),
+            ], 5 * GWEI, None),
+            (56, None, None, false, vec![
+                nonce.clone(),
+                json!(["eth_gasPrice", null]),
+                legacy("0x2540be400"),
+                send("0xf86a078502540be400831e84809411111111111111111111111111111111111111118084deadbeef8193a02553cb6593d490ac14e2c04dcfb9f182863d0ea4f45480fabdf238820d7f4c2ca01eff79175ddfe9047aa74a4920b4e5dcc44e00a7e5bd91c439814fc5eb66c9fe"),
+            ], 10 * GWEI, None),
+        ];
+
+        for (chain_id, max_fee, tip, history_fails, calls, fee, priority) in rows {
+            let stub = RpcStub::start(move |method: &str, params: &Value| {
+                if history_fails && method == "eth_feeHistory" && params[0] == json!("0xa") {
+                    return Err(json!({"code": -32602, "message": "invalid argument 0"}));
+                }
+                node_answer(method, params)
+            });
+            let hash = HttpEvmTransport
+                .send_transaction(stub_send_request(&stub.url, chain_id, max_fee, tip))
+                .expect("send tx");
+            assert_eq!(hash, STUB_TX_HASH);
+            assert_eq!(
+                json!(stub.calls()),
+                json!(calls),
+                "chain {chain_id} {max_fee:?}/{tip:?}"
+            );
+
+            let tx = decode_raw_tx(&stub.raw_txs()[0]);
+            assert_eq!(tx.chain_id(), Some(chain_id));
+            assert_eq!(
+                format!(
+                    "{:#x}",
+                    tx.signature()
+                        .recover_address_from_prehash(&tx.signature_hash())
+                        .expect("signer")
+                ),
+                SENDER
+            );
+            assert_eq!(tx.nonce(), 7);
+            assert_eq!(tx.gas_limit(), 2_000_000);
+            assert_eq!(tx.max_fee_per_gas(), fee);
+            assert_eq!(tx.max_priority_fee_per_gas(), priority);
+            assert_eq!(tx.is_legacy(), priority.is_none());
+        }
+    }
+
+    #[test]
+    fn http_transport_errors_keep_reason_and_retry_class() {
+        let revert = |message: &'static str| {
+            move |method: &str, params: &Value| {
+                if method == "eth_estimateGas" {
+                    return Err(
+                        json!({"code": 3, "message": message, "data": BLOCK_COMMITMENT_REVERT_DATA}),
+                    );
+                }
+                node_answer(method, params)
+            }
+        };
+        let send_error = |method: &str, params: &Value| {
+            if method == "eth_sendRawTransaction" {
+                return Err(json!({"code": -32000, "message": "nonce too low"}));
+            }
+            node_answer(method, params)
+        };
+        let send = |stub: &RpcStub| {
+            HttpEvmTransport
+                .send_transaction(stub_send_request(&stub.url, 421614, None, None))
+                .expect_err("send must fail")
+        };
+
+        let bare = RpcStub::start(revert("execution reverted"));
+        let with_reason = RpcStub::start(revert("execution reverted: block commitment"));
+        let rejected = RpcStub::start(send_error);
+        let mined_revert = RpcStub::start(|method: &str, params: &Value| {
+            if method == "eth_getTransactionReceipt" {
+                return Ok(json!({"status": "0x0", "blockNumber": "0x10"}));
+            }
+            node_answer(method, params)
+        });
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("free port")
+            .port();
+
+        let mined_revert_text = format!("transaction reverted on-chain: {STUB_TX_HASH}");
+        let cases = [
+            (
+                send(&bare),
+                vec![
+                    "eth_sendRawTransaction failed",
+                    "execution reverted",
+                    &BLOCK_COMMITMENT_REVERT_DATA[2..],
+                ],
+                RetryDecision::HardFailure,
+            ),
+            (
+                send(&with_reason),
+                vec!["execution reverted: block commitment"],
+                RetryDecision::HardFailure,
+            ),
+            (
+                send(&rejected),
+                vec!["eth_sendRawTransaction failed", "nonce too low"],
+                RetryDecision::HardFailure,
+            ),
+            (
+                stub_relay_client(&mined_revert.url)
+                    .submit_header(&"00".repeat(80))
+                    .expect_err("mined revert must fail"),
+                vec![mined_revert_text.as_str()],
+                RetryDecision::HardFailure,
+            ),
+            (
+                HttpEvmTransport
+                    .send_transaction(stub_send_request(
+                        &format!("http://127.0.0.1:{closed_port}"),
+                        421614,
+                        None,
+                        None,
+                    ))
+                    .expect_err("closed port must fail"),
+                vec!["eth_sendRawTransaction failed", "connection refused"],
+                RetryDecision::Retryable,
+            ),
+        ];
+        for (err, needles, decision) in cases {
+            let text = format!("{:#}", err);
+            for needle in needles {
+                assert!(
+                    text.to_lowercase().contains(&needle.to_lowercase()),
+                    "{text:?} lacks {needle:?}"
+                );
+            }
+            assert_eq!(classify_retry_decision(&text), decision, "{text}");
         }
     }
 

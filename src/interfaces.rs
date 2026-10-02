@@ -3,7 +3,7 @@
 
 //! Abstract ports for sync — Bitcoin RPC and on-chain relay operations (no HTTP, no ABI, no IO).
 //!
-//! Traits so the sync engine can be tested with fakes and isn't married to `reqwest` or `ethers`.
+//! Traits so the sync engine can be tested with fakes and isn't married to `reqwest` or `alloy`.
 //! If you add a second Bitcoin backend, implement `BitcoinRpcClient`; don't fork the loop.
 
 use anyhow::Result;
