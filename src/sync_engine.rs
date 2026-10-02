@@ -1083,6 +1083,83 @@ mod tests {
         assert_eq!(result, SyncResult::UpToDate);
     }
 
+    #[test]
+    fn run_poll_cycle_moves_relay_to_node_branch_after_reorg() {
+        // Node replaced blocks 109 and 110 with 109'..111'.
+        struct ReorgedBitcoin;
+        impl BitcoinRpcClient for ReorgedBitcoin {
+            fn get_block_count(&self) -> Result<u64> {
+                Ok(111)
+            }
+            fn get_block_hash(&self, height: u64) -> Result<String> {
+                if height >= 109 {
+                    return Ok(format!("new-{height}"));
+                }
+                Ok(format!("hash-{height}"))
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                Ok("new-111".to_string())
+            }
+            fn get_block_header_hex(&self, hash: &str) -> Result<String> {
+                if let Some(h) = hash.strip_prefix("new-") {
+                    return Ok(fake_full_header_hex(h.parse::<u64>()? + 1000));
+                }
+                let h = hash.strip_prefix("hash-").unwrap_or("0").parse::<u64>()?;
+                Ok(fake_full_header_hex(h))
+            }
+        }
+        // Relay stored the old branch up to 110. Main submit must extend its tip, as the contract checks.
+        struct OldBranchRelay {
+            headers: RefCell<Vec<String>>,
+        }
+        impl BtcRelaySubmitter for OldBranchRelay {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(self.headers.borrow().len() as u64 - 1)
+            }
+            fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+                Ok([0_u8; 32])
+            }
+            fn relay_commit_hash(&self, height: u64) -> Result<String> {
+                Ok(self.headers.borrow()[height as usize].clone())
+            }
+            fn submit_header(&self, header_hex: &str) -> Result<String> {
+                let payload = decode_even_hex(header_hex)?;
+                let height = u32::from_be_bytes(payload[112..116].try_into()?) as u64;
+                let mut headers = self.headers.borrow_mut();
+                if height != headers.len() as u64 - 1
+                    || header_hex[..160] != headers[height as usize]
+                {
+                    anyhow::bail!("execution reverted: submitMain: block commitment");
+                }
+                for c in payload[160..].chunks(48) {
+                    let h = [&c[0..4], &[0_u8; 32][..], &c[4..48]].concat();
+                    headers.push(h.iter().map(|b| format!("{b:02x}")).collect());
+                }
+                Ok("0xtx".to_string())
+            }
+        }
+
+        let bitcoin = ReorgedBitcoin;
+        let relay = OldBranchRelay {
+            headers: RefCell::new((0..=110).map(fake_full_header_hex).collect()),
+        };
+        let state_store = test_state_store();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        let result = run_poll_cycle(
+            &bitcoin,
+            &relay,
+            SyncTrigger::PollTick,
+            &mut loop_state,
+            &state_store,
+        );
+        assert!(matches!(result, Ok(SyncResult::Progressed)), "{result:?}");
+        assert_eq!(relay.relay_tip_height().unwrap(), 111);
+        assert_eq!(
+            relay.relay_commit_hash(111).unwrap(),
+            fake_full_header_hex(1111)
+        );
+    }
+
     fn test_state_store() -> JsonFileStateStore {
         let mut path = env::temp_dir();
         path.push(format!(
