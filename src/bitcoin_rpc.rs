@@ -177,6 +177,19 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
 
         Ok(header_hex)
     }
+
+    fn get_block_chainwork(&self, hash: &str) -> Result<[u8; 32]> {
+        let result = self
+            .rpc_call("getblockheader", json!([hash, true]))
+            .with_context(|| format!("getblockheader rpc call failed for hash {}", hash))?;
+        let chainwork = result["chainwork"]
+            .as_str()
+            .context("getblockheader returned no chainwork")?;
+        Ok(chainwork
+            .parse::<alloy::primitives::B256>()
+            .context("getblockheader returned invalid chainwork")?
+            .0)
+    }
 }
 
 #[cfg(test)]
@@ -234,7 +247,10 @@ mod tests {
 
     #[test]
     fn rejects_header_with_invalid_length() {
-        let url = spawn_test_server("200 OK", r#"{"result":"abcd","error":null,"id":"btc-relayer"}"#);
+        let url = spawn_test_server(
+            "200 OK",
+            r#"{"result":"abcd","error":null,"id":"btc-relayer"}"#,
+        );
         let client = HttpBitcoinRpcClient::new(
             url,
             "user".to_string(),
@@ -256,7 +272,10 @@ mod tests {
 
     #[test]
     fn get_block_count_parses_numeric_result() {
-        let url = spawn_test_server("200 OK", r#"{"result":777,"error":null,"id":"btc-relayer"}"#);
+        let url = spawn_test_server(
+            "200 OK",
+            r#"{"result":777,"error":null,"id":"btc-relayer"}"#,
+        );
         let client = HttpBitcoinRpcClient::new(
             url,
             "user".to_string(),
@@ -268,14 +287,19 @@ mod tests {
 
     #[test]
     fn get_block_hash_rejects_empty_result_string() {
-        let url = spawn_test_server("200 OK", r#"{"result":"  ","error":null,"id":"btc-relayer"}"#);
+        let url = spawn_test_server(
+            "200 OK",
+            r#"{"result":"  ","error":null,"id":"btc-relayer"}"#,
+        );
         let client = HttpBitcoinRpcClient::new(
             url,
             "user".to_string(),
             "pass".to_string(),
             Client::builder().build().expect("client"),
         );
-        let err = client.get_block_hash(1).expect_err("expected empty hash error");
+        let err = client
+            .get_block_hash(1)
+            .expect_err("expected empty hash error");
         assert!(err.to_string().contains("empty hash"));
     }
 
@@ -309,7 +333,9 @@ mod tests {
             "pass".to_string(),
             Client::builder().build().expect("client"),
         );
-        let err = client.get_block_count().expect_err("expected http status error");
+        let err = client
+            .get_block_count()
+            .expect_err("expected http status error");
         assert!(err.to_string().contains("getblockcount rpc call failed"));
     }
 }

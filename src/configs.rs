@@ -55,6 +55,10 @@ pub struct AppConfig {
     #[serde(default = "default_live_lag_threshold")]
     /// When `bitcoin_tip - relay_tip` is at or below this, submit **one** header per tx ("live" tail).
     pub live_lag_threshold: u64,
+    #[serde(default = "default_short_fork_limit")]
+    /// Max headers per `submitShortForkBlockheaders` call. Kept separate from `catchup_batch_size`:
+    /// the contract's short-fork gas limit can be tighter than the main-sync batch size.
+    pub short_fork_limit: u64,
     #[serde(default = "default_state_file_path")]
     /// Where we dump last-submitted height/hash JSON for operators (not the authority for resume — contract is).
     pub state_file_path: String,
@@ -88,7 +92,7 @@ impl AppConfig {
                 "BITCOIN_RPC_USER and BITCOIN_RPC_PASSWORD must be both set or both empty"
             );
         }
-        if self.bitcoin_rpc_timeout_secs <= 0 {
+        if self.bitcoin_rpc_timeout_secs == 0 {
             anyhow::bail!("BITCOIN_RPC_TIMEOUT_SECS must be > 0");
         }
         if self.bitcoin_ibd_poll_secs == 0 {
@@ -115,11 +119,14 @@ impl AppConfig {
         if self.evm_tx_timeout_secs == 0 {
             anyhow::bail!("EVM_TX_TIMEOUT_SECS must be > 0");
         }
-        if self.poll_interval_secs <= 0 {
+        if self.poll_interval_secs == 0 {
             anyhow::bail!("POLL_INTERVAL_SECS must be > 0");
         }
         if self.catchup_batch_size == 0 {
             anyhow::bail!("CATCHUP_BATCH_SIZE must be > 0");
+        }
+        if self.short_fork_limit == 0 {
+            anyhow::bail!("SHORT_FORK_LIMIT must be > 0");
         }
         if self.state_file_path.trim().is_empty() {
             anyhow::bail!("STATE_FILE_PATH must be non-empty");
@@ -164,6 +171,10 @@ fn default_catchup_batch_size() -> u64 {
     16 // trade gas vs round-trips; contract limits may force you lower.
 }
 
+fn default_short_fork_limit() -> u64 {
+    16 // matches default_catchup_batch_size; override if the contract's short-fork gas limit is tighter.
+}
+
 fn default_live_lag_threshold() -> u64 {
     2 // within this many blocks of tip → single-header txs.
 }
@@ -203,6 +214,7 @@ mod tests {
             start_height: 0,
             catchup_batch_size: 16,
             live_lag_threshold: 2,
+            short_fork_limit: 16,
             state_file_path: "artifacts/relay-state.json".to_string(),
             metrics_bind_addr: "127.0.0.1:9090".to_string(),
         }
@@ -226,7 +238,9 @@ mod tests {
         let mut cfg = valid_config();
         cfg.relay_contract_address = "0x1234".to_string();
         let err = cfg.validate().expect_err("expected invalid address error");
-        assert!(err.to_string().contains("valid 0x-prefixed 20-byte hex address"));
+        assert!(err
+            .to_string()
+            .contains("valid 0x-prefixed 20-byte hex address"));
     }
 
     #[test]
@@ -242,7 +256,9 @@ mod tests {
         let mut cfg = valid_config();
         cfg.state_file_path = "  ".to_string();
         let err = cfg.validate().expect_err("expected state file path error");
-        assert!(err.to_string().contains("STATE_FILE_PATH must be non-empty"));
+        assert!(err
+            .to_string()
+            .contains("STATE_FILE_PATH must be non-empty"));
     }
 
     #[test]
@@ -250,15 +266,27 @@ mod tests {
         let mut cfg = valid_config();
         cfg.bitcoin_rpc_url = "ftp://node".to_string();
         let err = cfg.validate().expect_err("expected bitcoin url error");
-        assert!(err.to_string().contains("BITCOIN_RPC_URL must start with http/https"));
+        assert!(err
+            .to_string()
+            .contains("BITCOIN_RPC_URL must start with http/https"));
     }
 
     #[test]
     fn validate_rejects_zero_catchup_batch_size() {
         let mut cfg = valid_config();
         cfg.catchup_batch_size = 0;
-        let err = cfg.validate().expect_err("expected catchup batch size error");
+        let err = cfg
+            .validate()
+            .expect_err("expected catchup batch size error");
         assert!(err.to_string().contains("CATCHUP_BATCH_SIZE must be > 0"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_short_fork_limit() {
+        let mut cfg = valid_config();
+        cfg.short_fork_limit = 0;
+        let err = cfg.validate().expect_err("expected short fork limit error");
+        assert!(err.to_string().contains("SHORT_FORK_LIMIT must be > 0"));
     }
 
     #[test]
@@ -266,7 +294,9 @@ mod tests {
         let mut cfg = valid_config();
         cfg.evm_rpc_url = "ws://node".to_string();
         let err = cfg.validate().expect_err("expected evm url error");
-        assert!(err.to_string().contains("EVM_RPC_URL must start with http/https"));
+        assert!(err
+            .to_string()
+            .contains("EVM_RPC_URL must start with http/https"));
     }
 
     #[test]
@@ -297,14 +327,19 @@ mod tests {
     fn validate_accepts_zero_low_balance_warn_threshold() {
         let mut cfg = valid_config();
         cfg.evm_low_balance_txs_left_warn = 0;
-        cfg.validate().expect("zero threshold disables low-balance warnings");
+        cfg.validate()
+            .expect("zero threshold disables low-balance warnings");
     }
 
     #[test]
     fn validate_rejects_empty_metrics_bind_addr() {
         let mut cfg = valid_config();
         cfg.metrics_bind_addr = " ".to_string();
-        let err = cfg.validate().expect_err("expected metrics bind addr error");
-        assert!(err.to_string().contains("METRICS_BIND_ADDR must be non-empty"));
+        let err = cfg
+            .validate()
+            .expect_err("expected metrics bind addr error");
+        assert!(err
+            .to_string()
+            .contains("METRICS_BIND_ADDR must be non-empty"));
     }
 }

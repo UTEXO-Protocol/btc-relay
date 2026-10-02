@@ -4,7 +4,7 @@
 //! HTTP/JSON-RPC client for the **on-chain BTCRelay contract** (reads via `eth_call`, writes via signed txs).
 //!
 //! Implementation detail: encode relay ABI with `alloy`, sign and send with `ethers`, poll receipts with bare JSON-RPC — two stacks, one job.
-//! MVP path only: `submitMainBlockheaders`. Fork helpers are compiled but unused — delete them when you're sure you won't need them.
+//! Main sync uses `submitMainBlockheaders`; a Bitcoin reorg uses `submitShortForkBlockheaders` or `submitForkBlockheaders`.
 
 use alloy::primitives::U256 as AlloyU256;
 use anyhow::{Context, Result};
@@ -33,7 +33,7 @@ use crate::metrics;
 const EVM_TX_HASH_HEX_LEN: usize = 66;
 
 // `IBtcRelayView`: alloy `sol!` view of the on-chain BTCRelay ABI we call (historical name; contract is BTCRelay).
-// Must match deployed bytecode. MVP calls only `submitMainBlockheaders`; fork entries keep unused calldata builders compiling.
+// Must match deployed bytecode.
 sol! {
     interface IBtcRelayView {
         function getBlockheight() external view returns (uint32);
@@ -94,10 +94,7 @@ trait EvmTransport: Send + Sync {
 /// JSON-RPC allows `"result": null` (e.g. pending `eth_getTransactionReceipt`).
 /// That is distinct from a response that omits `result` entirely.
 fn parse_json_rpc_response(response: Value, method: &str) -> Result<Value> {
-    if response
-        .get("error")
-        .is_some_and(|err| !err.is_null())
-    {
+    if response.get("error").is_some_and(|err| !err.is_null()) {
         let err = response.get("error").expect("checked above");
         anyhow::bail!("{} returned error: {}", method, err);
     }
@@ -295,7 +292,11 @@ impl EvmRelayContractClient {
 
             let receipt_value = self
                 .transport
-                .rpc_request(&self.evm_rpc_url, "eth_getTransactionReceipt", json!([tx_hash]))
+                .rpc_request(
+                    &self.evm_rpc_url,
+                    "eth_getTransactionReceipt",
+                    json!([tx_hash]),
+                )
                 .with_context(|| format!("failed eth_getTransactionReceipt for {}", tx_hash))?;
 
             if receipt_value.is_null() {
@@ -368,8 +369,7 @@ impl EvmRelayContractClient {
         call.abi_encode() // 4-byte selector + ABI-encoded `bytes` (offset + length + payload)
     }
 
-    /// Dead code today: would call `submitShortForkBlockheaders`. Wire it when fork drama is your problem.
-    #[allow(dead_code)]
+    /// ABI encode `submitShortForkBlockheaders(bytes)`.
     fn build_submit_short_fork_calldata(&self, headers_bytes: &[u8]) -> Vec<u8> {
         let owned_headers: Vec<u8> = headers_bytes.to_vec();
         let call = IBtcRelayView::submitShortForkBlockheadersCall {
@@ -378,15 +378,70 @@ impl EvmRelayContractClient {
         call.abi_encode()
     }
 
-    /// Dead code today: `submitForkBlockheaders(forkId, bytes)`.
-    #[allow(dead_code)]
+    /// ABI encode `submitForkBlockheaders(forkId, bytes)`.
     fn build_submit_fork_calldata(&self, fork_id: u64, headers_bytes: &[u8]) -> Vec<u8> {
         let owned_headers: Vec<u8> = headers_bytes.to_vec();
         let call = IBtcRelayView::submitForkBlockheadersCall {
-            forkId: AlloyU256::try_from(fork_id).unwrap(),
+            forkId: AlloyU256::from(fork_id),
             headers: owned_headers.into(),
         };
         call.abi_encode()
+    }
+
+    /// Sign, send, wait for confirmations, record fee metrics; return the tx hash.
+    fn submit_calldata(&self, calldata: &[u8]) -> Result<String> {
+        let tx_hash = self
+            .send_tx(calldata)
+            .context("failed to send header submission transaction")?;
+
+        // Only return once mined deep enough: sync loop assumes relay state reflects this tx.
+        let confirmation = self
+            .wait_for_confirmation(&tx_hash)
+            .context("header submission transaction failed confirmation step")?;
+        if let Some(tx_fee_wei) = confirmation.tx_fee_wei {
+            let tx_fee_wei_f64 = tx_fee_wei.to_string().parse::<f64>().unwrap_or(0.0);
+            let tx_fee_eth = tx_fee_wei_f64 / 1_000_000_000_000_000_000_f64;
+            metrics::record_confirmed_tx_fee_wei(tx_fee_wei_f64);
+            match self.relayer_wallet_balance_wei() {
+                Ok(balance_wei) => {
+                    let balance_wei_f64 = balance_wei.to_string().parse::<f64>().unwrap_or(0.0);
+                    let balance_eth = balance_wei_f64 / 1_000_000_000_000_000_000_f64;
+                    let txs_left = if tx_fee_wei > AlloyU256::from(0_u8) {
+                        balance_wei / tx_fee_wei
+                    } else {
+                        AlloyU256::from(0_u8)
+                    };
+                    let txs_left_f64 = txs_left.to_string().parse::<f64>().unwrap_or(0.0);
+                    metrics::set_estimated_txs_left(txs_left_f64);
+                    info!(
+                        tx_hash = %tx_hash,
+                        tx_fee_wei = %tx_fee_wei,
+                        tx_fee_eth,
+                        wallet_balance_wei = %balance_wei,
+                        wallet_balance_eth = balance_eth,
+                        est_txs_left_at_current_fee = %txs_left,
+                        "header submission confirmed"
+                    );
+                    if self.evm_low_balance_txs_left_warn > 0
+                        && txs_left <= AlloyU256::from(self.evm_low_balance_txs_left_warn)
+                    {
+                        warn!(
+                            tx_hash = %tx_hash,
+                            est_txs_left_at_current_fee = %txs_left,
+                            threshold = self.evm_low_balance_txs_left_warn,
+                            wallet_balance_eth = balance_eth,
+                            tx_fee_eth,
+                            "relayer funds are running low"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(tx_hash = %tx_hash, error = %err, "failed reading relayer wallet balance after tx confirmation");
+                }
+            }
+        }
+
+        Ok(tx_hash)
     }
 
     /// `eth_call` at `latest` — returns raw return bytes for us to ABI-decode per method.
@@ -438,7 +493,6 @@ impl EvmRelayContractClient {
             .to_string();
         parse_hex_quantity_u256(value.as_str()).context("invalid eth_getBalance format")
     }
-
 }
 
 /// Quick shape check before we enter the receipt polling loop.
@@ -503,58 +557,21 @@ impl BtcRelaySubmitter for EvmRelayContractClient {
             .context("failed to validate/convert submit payload hex")?;
         let calldata = self.build_submit_main_calldata(&header_bytes);
 
-        let tx_hash = self
-            .send_tx(&calldata)
-            .context("failed to send header submission transaction")?;
+        self.submit_calldata(&calldata)
+    }
 
-        // Only return once mined deep enough — sync loop assumes relay state reflects this tx.
-        let confirmation = self
-            .wait_for_confirmation(&tx_hash)
-            .context("header submission transaction failed confirmation step")?;
-        if let Some(tx_fee_wei) = confirmation.tx_fee_wei {
-            let tx_fee_wei_f64 = tx_fee_wei.to_string().parse::<f64>().unwrap_or(0.0);
-            let tx_fee_eth = tx_fee_wei_f64 / 1_000_000_000_000_000_000_f64;
-            metrics::record_confirmed_tx_fee_wei(tx_fee_wei_f64);
-            match self.relayer_wallet_balance_wei() {
-                Ok(balance_wei) => {
-                    let balance_wei_f64 = balance_wei.to_string().parse::<f64>().unwrap_or(0.0);
-                    let balance_eth = balance_wei_f64 / 1_000_000_000_000_000_000_f64;
-                    let txs_left = if tx_fee_wei > AlloyU256::from(0_u8) {
-                        balance_wei / tx_fee_wei
-                    } else {
-                        AlloyU256::from(0_u8)
-                    };
-                    let txs_left_f64 = txs_left.to_string().parse::<f64>().unwrap_or(0.0);
-                    metrics::set_estimated_txs_left(txs_left_f64);
-                    info!(
-                        tx_hash = %tx_hash,
-                        tx_fee_wei = %tx_fee_wei,
-                        tx_fee_eth,
-                        wallet_balance_wei = %balance_wei,
-                        wallet_balance_eth = balance_eth,
-                        est_txs_left_at_current_fee = %txs_left,
-                        "header submission confirmed"
-                    );
-                    if self.evm_low_balance_txs_left_warn > 0
-                        && txs_left <= AlloyU256::from(self.evm_low_balance_txs_left_warn)
-                    {
-                        warn!(
-                            tx_hash = %tx_hash,
-                            est_txs_left_at_current_fee = %txs_left,
-                            threshold = self.evm_low_balance_txs_left_warn,
-                            wallet_balance_eth = balance_eth,
-                            tx_fee_eth,
-                            "relayer funds are running low"
-                        );
-                    }
-                }
-                Err(err) => {
-                    warn!(tx_hash = %tx_hash, error = %err, "failed reading relayer wallet balance after tx confirmation");
-                }
-            }
-        }
+    fn submit_short_fork(&self, header_hex: &str) -> Result<String> {
+        let header_bytes = self
+            .payload_hex_to_bytes(header_hex)
+            .context("failed to validate/convert submit payload hex")?;
+        self.submit_calldata(&self.build_submit_short_fork_calldata(&header_bytes))
+    }
 
-        Ok(tx_hash)
+    fn submit_fork(&self, fork_id: u64, header_hex: &str) -> Result<String> {
+        let header_bytes = self
+            .payload_hex_to_bytes(header_hex)
+            .context("failed to validate/convert submit payload hex")?;
+        self.submit_calldata(&self.build_submit_fork_calldata(fork_id, &header_bytes))
     }
 
     fn relayer_wallet_address(&self) -> Result<String> {
@@ -663,7 +680,10 @@ mod tests {
 
     impl EvmTransport for MockEvmTransport {
         fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
-            self.rpc_methods.lock().expect("rpc methods lock").push(method.to_string());
+            self.rpc_methods
+                .lock()
+                .expect("rpc methods lock")
+                .push(method.to_string());
             match method {
                 "eth_getTransactionReceipt" => Ok(json!({
                     "status": self.receipt_status.lock().expect("receipt status lock").clone(),
@@ -686,7 +706,9 @@ mod tests {
         test_relay_client_with_transport(Arc::new(MockEvmTransport::new()))
     }
 
-    fn test_relay_client_with_transport(transport: Arc<dyn EvmTransport>) -> EvmRelayContractClient {
+    fn test_relay_client_with_transport(
+        transport: Arc<dyn EvmTransport>,
+    ) -> EvmRelayContractClient {
         EvmRelayContractClient {
             evm_rpc_url: "http://127.0.0.1:8545".to_string(),
             relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
@@ -758,7 +780,9 @@ mod tests {
         assert!(missing_prefix.to_string().contains("must start with 0x"));
 
         let bad_digits = parse_hex_quantity_u64("0xgg").expect_err("invalid hex should fail");
-        assert!(bad_digits.to_string().contains("failed to parse hex quantity"));
+        assert!(bad_digits
+            .to_string()
+            .contains("failed to parse hex quantity"));
     }
 
     #[test]
@@ -789,7 +813,10 @@ mod tests {
         let methods = mock.rpc_methods.lock().expect("methods lock");
         assert_eq!(
             methods.as_slice(),
-            &["eth_getTransactionReceipt".to_string(), "eth_blockNumber".to_string()]
+            &[
+                "eth_getTransactionReceipt".to_string(),
+                "eth_blockNumber".to_string()
+            ]
         );
     }
 
@@ -853,8 +880,10 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(MissingBlockTransport));
@@ -878,8 +907,10 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(MissingStatusTransport));
@@ -897,16 +928,16 @@ mod tests {
         impl EvmTransport for NonStringHeadTransport {
             fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
                 match method {
-                    "eth_getTransactionReceipt" => {
-                        Ok(json!({"status":"0x1","blockNumber":"0x10"}))
-                    }
+                    "eth_getTransactionReceipt" => Ok(json!({"status":"0x1","blockNumber":"0x10"})),
                     "eth_blockNumber" => Ok(json!({"not":"a string"})),
                     _ => anyhow::bail!("unexpected rpc method {}", method),
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(NonStringHeadTransport));
@@ -915,7 +946,9 @@ mod tests {
                 "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
             .expect_err("non-string head should fail");
-        assert!(err.to_string().contains("eth_blockNumber returned non-string result"));
+        assert!(err
+            .to_string()
+            .contains("eth_blockNumber returned non-string result"));
     }
 
     #[test]
@@ -924,16 +957,16 @@ mod tests {
         impl EvmTransport for BadReceiptBlockTransport {
             fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
                 match method {
-                    "eth_getTransactionReceipt" => {
-                        Ok(json!({"status":"0x1","blockNumber":"zz"}))
-                    }
+                    "eth_getTransactionReceipt" => Ok(json!({"status":"0x1","blockNumber":"zz"})),
                     "eth_blockNumber" => Ok(Value::String("0x10".to_string())),
                     _ => anyhow::bail!("unexpected rpc method {}", method),
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(BadReceiptBlockTransport));
@@ -958,15 +991,19 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(BadEthCallTransport));
         let err = submitter
             .relay_tip_height()
             .expect_err("invalid eth_call result should fail");
-        assert!(err.to_string().contains("failed to call BTCRelay.getBlockheight"));
+        assert!(err
+            .to_string()
+            .contains("failed to call BTCRelay.getBlockheight"));
     }
 
     #[test]
@@ -980,8 +1017,10 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(NonStringEthCallTransport));
@@ -1005,8 +1044,10 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let mut submitter = test_relay_client_with_transport(Arc::new(PendingReceiptTransport));
@@ -1016,7 +1057,9 @@ mod tests {
                 "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
             .expect_err("pending receipt should eventually timeout");
-        assert!(err.to_string().contains("timed out waiting for tx confirmation"));
+        assert!(err
+            .to_string()
+            .contains("timed out waiting for tx confirmation"));
     }
 
     #[test]
@@ -1065,15 +1108,19 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(NonStringEthCallTransport));
         let err = submitter
             .relay_chain_work_bytes()
             .expect_err("non-string eth_call should fail");
-        assert!(err.to_string().contains("failed to call BTCRelay.getChainwork"));
+        assert!(err
+            .to_string()
+            .contains("failed to call BTCRelay.getChainwork"));
     }
 
     #[test]
@@ -1087,15 +1134,19 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(BadHexEthCallTransport));
         let err = submitter
             .relay_chain_work_bytes()
             .expect_err("invalid hex eth_call should fail");
-        assert!(err.to_string().contains("failed to call BTCRelay.getChainwork"));
+        assert!(err
+            .to_string()
+            .contains("failed to call BTCRelay.getChainwork"));
     }
 
     #[test]
@@ -1109,8 +1160,10 @@ mod tests {
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(WrongAbiShapeTransport));
@@ -1128,16 +1181,16 @@ mod tests {
         impl EvmTransport for BadHeadFormatTransport {
             fn rpc_request(&self, _rpc_url: &str, method: &str, _params: Value) -> Result<Value> {
                 match method {
-                    "eth_getTransactionReceipt" => {
-                        Ok(json!({"status":"0x1","blockNumber":"0x10"}))
-                    }
+                    "eth_getTransactionReceipt" => Ok(json!({"status":"0x1","blockNumber":"0x10"})),
                     "eth_blockNumber" => Ok(Value::String("zz".to_string())),
                     _ => anyhow::bail!("unexpected rpc method {}", method),
                 }
             }
             fn send_transaction(&self, _request: SendTxRequest) -> Result<String> {
-                Ok("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_string())
+                Ok(
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )
             }
         }
         let submitter = test_relay_client_with_transport(Arc::new(BadHeadFormatTransport));
@@ -1188,13 +1241,15 @@ mod tests {
 
         let server_thread = thread::spawn(move || {
             let request = server.recv().expect("mock rpc request");
-            let response = tiny_http::Response::from_string(
-                r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
-            )
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .expect("content-type header"),
-            );
+            let response =
+                tiny_http::Response::from_string(r#"{"jsonrpc":"2.0","id":1,"result":null}"#)
+                    .with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"application/json"[..],
+                        )
+                        .expect("content-type header"),
+                    );
             request.respond(response).expect("mock rpc response");
         });
 

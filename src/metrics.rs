@@ -3,10 +3,9 @@
 
 use anyhow::Result;
 use prometheus::{
-    Encoder, Gauge, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder, opts,
-    register_gauge_with_registry,
-    register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_with_registry,
+    opts, register_gauge_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry, Encoder, Gauge,
+    IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
 };
 use serde_json::json;
 use std::sync::OnceLock;
@@ -44,7 +43,10 @@ fn metrics() -> &'static Metrics {
         let registry = registry();
         Metrics {
             startup_checks_total: register_int_counter_vec_with_registry!(
-                opts!("startup_checks_total", "Startup checks attempted by check name"),
+                opts!(
+                    "startup_checks_total",
+                    "Startup checks attempted by check name"
+                ),
                 &["check"],
                 registry
             )
@@ -64,22 +66,34 @@ fn metrics() -> &'static Metrics {
             )
             .expect("register sync_poll_cycles_total"),
             sync_poll_cycle_errors_total: register_int_counter_with_registry!(
-                opts!("sync_poll_cycle_errors_total", "Sync poll cycles that ended in error"),
+                opts!(
+                    "sync_poll_cycle_errors_total",
+                    "Sync poll cycles that ended in error"
+                ),
                 registry
             )
             .expect("register sync_poll_cycle_errors_total"),
             sync_poll_up_to_date_total: register_int_counter_with_registry!(
-                opts!("sync_poll_up_to_date_total", "Poll cycles where relay was up-to-date"),
+                opts!(
+                    "sync_poll_up_to_date_total",
+                    "Poll cycles where relay was up-to-date"
+                ),
                 registry
             )
             .expect("register sync_poll_up_to_date_total"),
             sync_poll_progressed_total: register_int_counter_with_registry!(
-                opts!("sync_poll_progressed_total", "Poll cycles that submitted progress"),
+                opts!(
+                    "sync_poll_progressed_total",
+                    "Poll cycles that submitted progress"
+                ),
                 registry
             )
             .expect("register sync_poll_progressed_total"),
             sync_headers_submitted_total: register_int_counter_with_registry!(
-                opts!("sync_headers_submitted_total", "Headers submitted by sync engine"),
+                opts!(
+                    "sync_headers_submitted_total",
+                    "Headers submitted by sync engine"
+                ),
                 registry
             )
             .expect("register sync_headers_submitted_total"),
@@ -89,42 +103,66 @@ fn metrics() -> &'static Metrics {
             )
             .expect("register sync_retries_total"),
             relayer_tx_confirmed_total: register_int_counter_with_registry!(
-                opts!("relayer_tx_confirmed_total", "Confirmed relayer submission transactions"),
+                opts!(
+                    "relayer_tx_confirmed_total",
+                    "Confirmed relayer submission transactions"
+                ),
                 registry
             )
             .expect("register relayer_tx_confirmed_total"),
             relayer_tx_fee_wei_total: register_gauge_with_registry!(
-                opts!("relayer_tx_fee_wei_total", "Cumulative relayer transaction fees in wei"),
+                opts!(
+                    "relayer_tx_fee_wei_total",
+                    "Cumulative relayer transaction fees in wei"
+                ),
                 registry
             )
             .expect("register relayer_tx_fee_wei_total"),
             relayer_tx_fee_eth_total: register_gauge_with_registry!(
-                opts!("relayer_tx_fee_eth_total", "Cumulative relayer transaction fees in ETH"),
+                opts!(
+                    "relayer_tx_fee_eth_total",
+                    "Cumulative relayer transaction fees in ETH"
+                ),
                 registry
             )
             .expect("register relayer_tx_fee_eth_total"),
             bitcoin_tip_height: register_int_gauge_with_registry!(
-                opts!("bitcoin_tip_height", "Latest Bitcoin tip height seen by sync loop"),
+                opts!(
+                    "bitcoin_tip_height",
+                    "Latest Bitcoin tip height seen by sync loop"
+                ),
                 registry
             )
             .expect("register bitcoin_tip_height"),
             relay_tip_height: register_int_gauge_with_registry!(
-                opts!("relay_tip_height", "Latest relay tip height seen by sync loop"),
+                opts!(
+                    "relay_tip_height",
+                    "Latest relay tip height seen by sync loop"
+                ),
                 registry
             )
             .expect("register relay_tip_height"),
             relay_lag_blocks: register_int_gauge_with_registry!(
-                opts!("relay_lag_blocks", "Current lag between bitcoin tip and relay tip"),
+                opts!(
+                    "relay_lag_blocks",
+                    "Current lag between bitcoin tip and relay tip"
+                ),
                 registry
             )
             .expect("register relay_lag_blocks"),
             relayer_wallet_balance_wei: register_gauge_with_registry!(
-                opts!("relayer_wallet_balance_wei", "Relayer wallet balance in wei"),
+                opts!(
+                    "relayer_wallet_balance_wei",
+                    "Relayer wallet balance in wei"
+                ),
                 registry
             )
             .expect("register relayer_wallet_balance_wei"),
             relayer_wallet_balance_eth: register_gauge_with_registry!(
-                opts!("relayer_wallet_balance_eth", "Relayer wallet balance in ETH"),
+                opts!(
+                    "relayer_wallet_balance_eth",
+                    "Relayer wallet balance in ETH"
+                ),
                 registry
             )
             .expect("register relayer_wallet_balance_eth"),

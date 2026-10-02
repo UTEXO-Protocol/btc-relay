@@ -34,6 +34,10 @@ pub trait BitcoinRpcClient {
     fn get_best_block_hash(&self) -> Result<String>;
     /// Serialized header hex for a hash (`getblockheader`, verbose=false style string).
     fn get_block_header_hex(&self, hash: &str) -> Result<String>;
+    /// `chainwork` of `getblockheader(hash)` as 32 big-endian bytes.
+    fn get_block_chainwork(&self, _hash: &str) -> Result<[u8; 32]> {
+        anyhow::bail!("block chainwork not supported by this client")
+    }
 }
 
 /// Read/write surface of the on-chain relay. **Canonical progress** for sync is `relay_tip_height()`.
@@ -51,6 +55,21 @@ pub trait BtcRelaySubmitter {
     /// Submit headers: `header_hex` is **no-0x**, even length; may be one header or a **batch** ABI encoding from the sync engine.
     /// Returns the tx hash so logs can correlate on-chain receipts.
     fn submit_header(&self, header_hex: &str) -> Result<String>;
+
+    /// `submitShortForkBlockheaders`: same payload as `submit_header`, parent on the relay main chain.
+    fn submit_short_fork(&self, _header_hex: &str) -> Result<String> {
+        anyhow::bail!("short fork submission not supported by this submitter")
+    }
+
+    /// `submitForkBlockheaders(fork_id, …)`: one fork may take several calls.
+    fn submit_fork(&self, _fork_id: u64, _header_hex: &str) -> Result<String> {
+        anyhow::bail!("fork submission not supported by this submitter")
+    }
+
+    /// Commitment the relay stores for a 160-byte stored header, in the format of `relay_commit_hash`.
+    fn stored_header_commitment(&self, stored_header: &[u8]) -> String {
+        alloy::primitives::keccak256(stored_header).to_string()
+    }
 
     /// Optional capability: relayer wallet address used for sending txs.
     /// Backends that do not manage a wallet can keep the default "unsupported" behavior.

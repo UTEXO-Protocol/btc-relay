@@ -190,12 +190,14 @@ where
     let tip_height = evm_relay_contract
         .relay_tip_height()
         .context("evm relay read check failed at relay_tip_height")?;
-    let tip_commit_hash = evm_relay_contract.relay_commit_hash(tip_height).with_context(|| {
-        format!(
-            "evm relay read check failed at relay_commit_hash({})",
-            tip_height
-        )
-    })?;
+    let tip_commit_hash = evm_relay_contract
+        .relay_commit_hash(tip_height)
+        .with_context(|| {
+            format!(
+                "evm relay read check failed at relay_commit_hash({})",
+                tip_height
+            )
+        })?;
     let wallet_address = evm_relay_contract
         .relayer_wallet_address()
         .context("evm relay read check failed at relayer_wallet_address")?;
@@ -302,6 +304,7 @@ mod tests {
             start_height: 0,
             catchup_batch_size: 16,
             live_lag_threshold: 2,
+            short_fork_limit: 16,
             state_file_path: "artifacts/relay-state.json".to_string(),
             metrics_bind_addr: "127.0.0.1:9090".to_string(),
         }
@@ -476,7 +479,9 @@ mod tests {
         }
         let err = run_bitcoin_rpc_smoke_check_with_client(&cfg, &FailingHeaderFetch)
             .expect_err("expected header fetch failure");
-        assert!(err.to_string().contains("get_block_header_hex for best hash best"));
+        assert!(err
+            .to_string()
+            .contains("get_block_header_hex for best hash best"));
     }
 
     #[test]
@@ -536,6 +541,9 @@ mod tests {
         };
         run_bitcoin_rpc_smoke_check_with_client(&cfg, &rpc)
             .expect("smoke check should recover from temporary IBD error");
-        assert_eq!(&*rpc.header_requests.borrow(), &["best-after-error".to_string()]);
+        assert_eq!(
+            &*rpc.header_requests.borrow(),
+            &["best-after-error".to_string()]
+        );
     }
 }
