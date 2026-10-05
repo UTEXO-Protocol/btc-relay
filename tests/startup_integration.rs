@@ -46,9 +46,8 @@ fn test_config(bitcoin_url: String, evm_url: String) -> AppConfig {
         bitcoin_ibd_poll_secs: 1,
         evm_rpc_url: evm_url,
         relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
-        relayer_private_key:
-            "0x0000000000000000000000000000000000000000000000000000000000000001"
-                .to_string(),
+        relayer_private_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+            .to_string(),
         evm_chain_id: 31337,
         evm_tx_confirmations: 1,
         evm_tx_timeout_secs: 10,
@@ -59,6 +58,7 @@ fn test_config(bitcoin_url: String, evm_url: String) -> AppConfig {
         start_height: 0,
         catchup_batch_size: 16,
         live_lag_threshold: 2,
+        short_fork_limit: 16,
         state_file_path: "artifacts/relay-state.json".to_string(),
         metrics_bind_addr: "127.0.0.1:9090".to_string(),
     }
@@ -71,8 +71,14 @@ fn bitcoin_startup_smoke_check_succeeds_against_mock_rpc_server() {
     let bitcoin_url = spawn_json_rpc_server(vec![
         r#"{"result":{"initialblockdownload":false},"error":null,"id":"btc-relayer"}"#.to_string(),
         r#"{"result":123,"error":null,"id":"btc-relayer"}"#.to_string(),
-        format!(r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#, best_hash),
-        format!(r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#, header_hex),
+        format!(
+            r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#,
+            best_hash
+        ),
+        format!(
+            r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#,
+            header_hex
+        ),
     ]);
     let cfg = test_config(bitcoin_url, "http://127.0.0.1:8545".to_string());
     startup::run_bitcoin_rpc_smoke_check(&cfg).expect("bitcoin smoke check should pass");
@@ -84,7 +90,10 @@ fn bitcoin_startup_smoke_check_fails_on_bad_header_response() {
     let bitcoin_url = spawn_json_rpc_server(vec![
         r#"{"result":{"initialblockdownload":false},"error":null,"id":"btc-relayer"}"#.to_string(),
         r#"{"result":321,"error":null,"id":"btc-relayer"}"#.to_string(),
-        format!(r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#, best_hash),
+        format!(
+            r#"{{"result":"{}","error":null,"id":"btc-relayer"}}"#,
+            best_hash
+        ),
         r#"{"result":"abcd","error":null,"id":"btc-relayer"}"#.to_string(),
     ]);
     let cfg = test_config(bitcoin_url, "http://127.0.0.1:8545".to_string());

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
@@ -76,6 +76,11 @@ pub struct SyncLoopState {
     pub catchup_batch_size: u64,
     /// When remaining lag ≤ this, force batch size 1 ("live" tail).
     pub live_lag_threshold: u64,
+    /// Max headers per `submitShortForkBlockheaders` call. The contract's short-fork gas limit can be
+    /// tighter than `catchup_batch_size`, so this is set independently; defaults to `catchup_batch_size`.
+    pub short_fork_limit: u64,
+    /// `(bitcoin_tip, relay_tip)` of a reorg the relay did not follow. No submit until a tip changes.
+    pub reorg_hold: Option<(u64, u64)>,
 }
 
 impl SyncLoopState {
@@ -86,6 +91,8 @@ impl SyncLoopState {
             start_height,
             catchup_batch_size,
             live_lag_threshold,
+            short_fork_limit: catchup_batch_size,
+            reorg_hold: None,
         }
     }
 }
@@ -98,17 +105,20 @@ pub fn run_sync_loop(
     start_height: u64,
     catchup_batch_size: u64,
     live_lag_threshold: u64,
+    short_fork_limit: u64,
     state_store: &JsonFileStateStore,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(poll_interval_secs.max(1));
     let mut loop_state =
         SyncLoopState::new(start_height, catchup_batch_size.max(1), live_lag_threshold);
+    loop_state.short_fork_limit = short_fork_limit.max(1);
 
     info!(
         poll_interval_secs = poll_interval.as_secs(),
         start_height,
         catchup_batch_size = loop_state.catchup_batch_size,
         live_lag_threshold = loop_state.live_lag_threshold,
+        short_fork_limit = loop_state.short_fork_limit,
         "sync loop started"
     );
     if let Some(state) = state_store
@@ -176,6 +186,13 @@ fn run_poll_cycle(
         );
         return Ok(SyncResult::UpToDate);
     }
+    if loop_state.reorg_hold == Some((bitcoin_tip, relay_tip)) {
+        warn!(
+            relay_tip,
+            bitcoin_tip, "relay did not follow the node branch; waiting for a new tip"
+        );
+        return Ok(SyncResult::ReorgDetected);
+    }
 
     // Persisted state is advisory only; helper below still anchors to relay tip + 1.
     let persisted_state = state_store
@@ -188,14 +205,26 @@ fn run_poll_cycle(
             .context("failed to calculate catch-up range")?;
 
     loop_state.state = SyncEngineState::CatchingUp;
-    let progress = process_catchup_range(
+    let progress = match process_catchup_range(
         bitcoin,
         submitter,
         from_height,
         to_height,
         loop_state,
         state_store,
-    )?;
+    ) {
+        Ok(progress) => progress,
+        Err(err) => {
+            return follow_reorg(
+                bitcoin,
+                submitter,
+                bitcoin_tip,
+                err,
+                loop_state,
+                state_store,
+            )
+        }
+    };
     info!(
         from_height,
         to_height,
@@ -208,6 +237,135 @@ fn run_poll_cycle(
     metrics::add_sync_headers_submitted(progress.submitted);
     metrics::add_sync_retries(progress.retries);
     Ok(SyncResult::Progressed)
+}
+
+/// Main submit failed. If the relay holds blocks the node replaced, move the relay to the node branch.
+fn follow_reorg(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    bitcoin_tip: u64,
+    main_err: anyhow::Error,
+    loop_state: &mut SyncLoopState,
+    state_store: &JsonFileStateStore,
+) -> Result<SyncResult> {
+    let relay_tip = submitter.relay_tip_height()?;
+    let top = relay_tip.min(bitcoin_tip);
+    let fork_point = find_fork_point(bitcoin, submitter, top)?;
+    if fork_point == Some(top) {
+        return Err(main_err);
+    }
+    let result = match fork_point {
+        Some(fork_point) => submit_branch(
+            bitcoin,
+            submitter,
+            fork_point,
+            bitcoin_tip,
+            loop_state.short_fork_limit,
+            loop_state.catchup_batch_size,
+        ),
+        None => Err(anyhow::anyhow!(
+            "no common block above the relay checkpoint"
+        )),
+    };
+    match result {
+        Ok(()) => {
+            info!(
+                ?fork_point,
+                relay_tip, bitcoin_tip, "relay moved to the node branch"
+            );
+            let state = RelayProgressState::new(bitcoin_tip, bitcoin.get_block_hash(bitcoin_tip)?);
+            state_store.save(&state)?;
+            metrics::inc_sync_poll_progressed();
+            if let Some(fork_point) = fork_point {
+                metrics::add_sync_headers_submitted(bitcoin_tip.saturating_sub(fork_point));
+            }
+            metrics::set_tip_gauges(bitcoin_tip, bitcoin_tip, 0);
+            Ok(SyncResult::Progressed)
+        }
+        Err(err) => {
+            let reason = format!("{:#}", err);
+            warn!(?fork_point, relay_tip, bitcoin_tip, reason = %reason, "relay did not follow the node branch");
+            if classify_retry_decision(&reason) == RetryDecision::Retryable {
+                return Ok(SyncResult::TemporaryFailure);
+            }
+            loop_state.reorg_hold = Some((bitcoin_tip, relay_tip));
+            Ok(SyncResult::ReorgDetected)
+        }
+    }
+}
+
+/// Highest height at or below `top` where the relay holds the node block. `None` when no height above the checkpoint agrees.
+/// Each side is one chain, so the heights that agree are contiguous below the fork point: scan down from `top`.
+fn find_fork_point(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    top: u64,
+) -> Result<Option<u64>> {
+    for height in (0..=top).rev() {
+        match relay_holds_node_block(bitcoin, submitter, height)? {
+            Some(true) => return Ok(Some(height)),
+            Some(false) => continue,
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// `None` below the relay checkpoint, else whether the relay commitment at `height` is the node block.
+fn relay_holds_node_block(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    height: u64,
+) -> Result<Option<bool>> {
+    // The stored header needs 10 earlier timestamps.
+    if height < 10 {
+        return Ok(None);
+    }
+    let commit = submitter.relay_commit_hash(height)?;
+    if commit.trim_start_matches("0x").bytes().all(|b| b == b'0') {
+        return Ok(None);
+    }
+    let chain_work = bitcoin.get_block_chainwork(&bitcoin.get_block_hash(height)?)?;
+    let stored_header = build_stored_header(bitcoin, height, chain_work)?;
+    Ok(Some(
+        submitter.stored_header_commitment(&stored_header) == commit,
+    ))
+}
+
+/// Submit the node blocks above `fork_point` up to `end` as a short fork, or as a fork in batches.
+/// `short_fork_limit` and `batch_size` are separate: the contract's short-fork gas limit can be
+/// tighter than the main-sync batch size used to chunk a long fork.
+fn submit_branch(
+    bitcoin: &dyn BitcoinRpcClient,
+    submitter: &dyn BtcRelaySubmitter,
+    fork_point: u64,
+    end: u64,
+    short_fork_limit: u64,
+    batch_size: u64,
+) -> Result<()> {
+    let payload = |parent: u64, last: u64| -> Result<String> {
+        let chain_work = bitcoin.get_block_chainwork(&bitcoin.get_block_hash(parent)?)?;
+        build_payload_hex(bitcoin, parent, chain_work, last)
+    };
+    if end - fork_point <= short_fork_limit {
+        submitter.submit_short_fork(&payload(fork_point, end)?)?;
+    } else {
+        // The contract keys forks by sender and id. A new id per attempt never continues a stale fork.
+        let fork_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        let mut parent = fork_point;
+        while parent < end {
+            let last = parent.saturating_add(batch_size).min(end);
+            submitter.submit_fork(fork_id, &payload(parent, last)?)?;
+            parent = last;
+        }
+    }
+    // A fork with less work stays off the main chain and does not revert.
+    if submitter.relay_tip_height()? < end
+        || relay_holds_node_block(bitcoin, submitter, end)? != Some(true)
+    {
+        anyhow::bail!("relay main chain does not hold the node block at {}", end);
+    }
+    Ok(())
 }
 
 fn refresh_wallet_balance_metrics(submitter: &dyn BtcRelaySubmitter) {
@@ -383,8 +541,25 @@ fn build_submit_main_payload_hex_for_range(
     start_height: u64,
     end_height: u64,
 ) -> Result<String> {
+    // Chainwork comes from relay contract, not local recompute: matches contract internal accumulator.
+    let chain_work = submitter
+        .relay_chain_work_bytes()
+        .context("failed to fetch relay chainwork bytes")?;
     // Contract payload needs the parent of `start_height` as context.
-    let previous_height = start_height.saturating_sub(1);
+    build_payload_hex(
+        bitcoin,
+        start_height.saturating_sub(1),
+        chain_work,
+        end_height,
+    )
+}
+
+/// 160-byte stored header of block `previous_height`, as the relay commits it, with `chain_work` at that block.
+fn build_stored_header(
+    bitcoin: &dyn BitcoinRpcClient,
+    previous_height: u64,
+    chain_work: [u8; 32],
+) -> Result<Vec<u8>> {
     let previous_hash = bitcoin.get_block_hash(previous_height).with_context(|| {
         format!(
             "failed get_block_hash for previous height {}",
@@ -453,11 +628,6 @@ fn build_submit_main_payload_hex_for_range(
         .with_context(|| format!("failed decode epoch start header at {}", epoch_start_height))?;
     let last_diff_adjustment = parse_timestamp_from_header(&epoch_start_header_bytes)?;
 
-    // Chainwork comes from relay contract, not local recompute — matches contract internal accumulator.
-    let chain_work = submitter
-        .relay_chain_work_bytes()
-        .context("failed to fetch relay chainwork bytes")?;
-
     // --- 160-byte prologue (parent header + relay context + MedianTimePast window) ---
     let mut payload = Vec::with_capacity(160 + 48);
     payload.extend_from_slice(&previous_header_bytes); // 80: full header of block before range
@@ -473,9 +643,20 @@ fn build_submit_main_payload_hex_for_range(
             payload.len()
         );
     }
+    Ok(payload)
+}
+
+/// Stored header of `parent_height` with `chain_work`, then the compact headers up to `end_height`.
+fn build_payload_hex(
+    bitcoin: &dyn BitcoinRpcClient,
+    parent_height: u64,
+    chain_work: [u8; 32],
+    end_height: u64,
+) -> Result<String> {
+    let mut payload = build_stored_header(bitcoin, parent_height, chain_work)?;
 
     // --- 48-byte "compact" headers appended in chain order (version + merkle + time + bits + nonce, LE where Bitcoin uses LE) ---
-    for h in start_height..=end_height {
+    for h in parent_height.saturating_add(1)..=end_height {
         let current_hash = bitcoin
             .get_block_hash(h)
             .with_context(|| format!("failed get_block_hash for compact header height {}", h))?;
@@ -672,14 +853,16 @@ fn resolve_resume_start_height(
 mod tests {
     use super::{
         backoff_delay_secs, build_submit_main_payload_hex_for_range, choose_submission_batch_size,
-        classify_retry_decision, compute_catchup_range, decode_even_hex, parse_timestamp_from_header,
-        process_catchup_range, process_submit_batch, resolve_resume_start_height, run_poll_cycle,
-        RetryDecision, SyncEngineState, SyncLoopState, SyncResult, SyncTrigger,
+        classify_retry_decision, compute_catchup_range, decode_even_hex,
+        parse_timestamp_from_header, process_catchup_range, process_submit_batch,
+        resolve_resume_start_height, run_poll_cycle, RetryDecision, SyncEngineState, SyncLoopState,
+        SyncResult, SyncTrigger,
     };
     use crate::interfaces::{BitcoinRpcClient, BtcRelaySubmitter};
     use crate::persistence::{JsonFileStateStore, RelayProgressState};
     use anyhow::Result;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
 
@@ -1010,9 +1193,12 @@ mod tests {
         let submitter = HardFailSubmitter;
         let state_store = test_state_store();
         let mut loop_state = SyncLoopState::new(0, 16, 2);
-        let err = process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
-            .expect_err("hard failure should bubble");
-        assert!(err.to_string().contains("hard failure while processing range"));
+        let err =
+            process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
+                .expect_err("hard failure should bubble");
+        assert!(err
+            .to_string()
+            .contains("hard failure while processing range"));
         assert_eq!(loop_state.state, SyncEngineState::Error);
     }
 
@@ -1029,8 +1215,9 @@ mod tests {
         fs::create_dir_all(&bad_path).expect("create dir path");
         let state_store = JsonFileStateStore::new(&bad_path);
         let mut loop_state = SyncLoopState::new(0, 16, 2);
-        let err = process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
-            .expect_err("persist failure should bubble");
+        let err =
+            process_catchup_range(&bitcoin, &submitter, 13, 13, &mut loop_state, &state_store)
+                .expect_err("persist failure should bubble");
         assert!(err.to_string().contains("failed persisting relay state"));
         let _ = fs::remove_dir_all(&bad_path);
     }
@@ -1083,12 +1270,301 @@ mod tests {
         assert_eq!(result, SyncResult::UpToDate);
     }
 
+    #[test]
+    fn run_poll_cycle_moves_relay_to_node_branch_after_reorg() {
+        // Node replaced blocks 109 and 110 with 109'..111'.
+        let node = BranchNode {
+            tip: Cell::new(111),
+            fork_from: 109,
+        };
+        let relay = BranchRelay::new(110, false);
+        let result = poll(&node, &relay, 16);
+        assert!(matches!(result, Ok(SyncResult::Progressed)), "{result:?}");
+        assert_eq!(relay.relay_tip_height().unwrap(), 111);
+        assert_eq!(
+            relay.relay_commit_hash(111).unwrap(),
+            fake_full_header_hex(1111)
+        );
+    }
+
+    /// Node whose blocks from `fork_from` up come from a second branch.
+    struct BranchNode {
+        tip: Cell<u64>,
+        fork_from: u64,
+    }
+
+    impl BitcoinRpcClient for BranchNode {
+        fn get_block_count(&self) -> Result<u64> {
+            Ok(self.tip.get())
+        }
+        fn get_block_hash(&self, height: u64) -> Result<String> {
+            if height > self.tip.get() {
+                anyhow::bail!("block height out of range");
+            }
+            if height >= self.fork_from {
+                return Ok(format!("new-{height}"));
+            }
+            Ok(format!("old-{height}"))
+        }
+        fn get_best_block_hash(&self) -> Result<String> {
+            self.get_block_hash(self.tip.get())
+        }
+        fn get_block_header_hex(&self, hash: &str) -> Result<String> {
+            let (branch, height) = hash.split_once('-').expect("hash");
+            let height = height.parse::<u64>()?;
+            Ok(fake_full_header_hex(if branch == "new" {
+                height + 1000
+            } else {
+                height
+            }))
+        }
+        fn get_block_chainwork(&self, _hash: &str) -> Result<[u8; 32]> {
+            Ok([0_u8; 32])
+        }
+    }
+
+    /// Relay with checkpoint 100 that holds the old branch up to `tip`. Each block has the same work.
+    struct BranchRelay {
+        // Header hex by height; empty below the checkpoint.
+        main: RefCell<Vec<String>>,
+        forks: RefCell<HashMap<u64, Vec<String>>>,
+        calls: RefCell<Vec<String>>,
+        lighter: bool,
+    }
+
+    impl BranchRelay {
+        fn new(tip: u64, lighter: bool) -> Self {
+            let main = (0..=tip)
+                .map(|h| {
+                    if h < 100 {
+                        String::new()
+                    } else {
+                        fake_full_header_hex(h)
+                    }
+                })
+                .collect();
+            Self {
+                main: RefCell::new(main),
+                forks: RefCell::new(HashMap::new()),
+                calls: RefCell::new(Vec::new()),
+                lighter,
+            }
+        }
+
+        // Check the stored header against `chain`, then append the compact headers to it.
+        fn extend(chain: &mut Vec<String>, header_hex: &str) -> Result<(u64, u64)> {
+            let payload = decode_even_hex(header_hex)?;
+            let parent = u32::from_be_bytes(payload[112..116].try_into()?) as usize;
+            if parent >= chain.len() || header_hex[..160] != chain[parent] {
+                anyhow::bail!("execution reverted: block commitment");
+            }
+            chain.truncate(parent + 1);
+            for c in payload[160..].chunks(48) {
+                let h = [&c[0..4], &[0_u8; 32][..], &c[4..48]].concat();
+                chain.push(h.iter().map(|b| format!("{b:02x}")).collect());
+            }
+            Ok((parent as u64, chain.len() as u64 - 1))
+        }
+
+        fn record(&self, kind: &str, result: &Result<(u64, u64)>) {
+            self.calls.borrow_mut().push(match result {
+                Ok((parent, last)) => format!("{kind} {parent}..{last}"),
+                Err(err) => format!("{kind} {err}"),
+            });
+        }
+    }
+
+    impl BtcRelaySubmitter for BranchRelay {
+        fn relay_tip_height(&self) -> Result<u64> {
+            Ok(self.main.borrow().len() as u64 - 1)
+        }
+        fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+            Ok([0_u8; 32])
+        }
+        fn relay_commit_hash(&self, height: u64) -> Result<String> {
+            let commit = self.main.borrow().get(height as usize).cloned();
+            Ok(commit
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| format!("0x{}", "0".repeat(64))))
+        }
+        fn submit_header(&self, header_hex: &str) -> Result<String> {
+            let mut chain = self.main.borrow().clone();
+            let result = Self::extend(&mut chain, header_hex).and_then(|r| {
+                if r.0 + 1 != self.main.borrow().len() as u64 {
+                    anyhow::bail!("execution reverted: block commitment");
+                }
+                Ok(r)
+            });
+            self.record("main", &result);
+            if result.is_ok() {
+                *self.main.borrow_mut() = chain;
+            }
+            result.map(|_| "0xtx".to_string())
+        }
+        fn submit_short_fork(&self, header_hex: &str) -> Result<String> {
+            let mut chain = self.main.borrow().clone();
+            let result = Self::extend(&mut chain, header_hex).and_then(|r| {
+                if self.lighter || chain.len() <= self.main.borrow().len() {
+                    anyhow::bail!("execution reverted: shortFork: not enough work");
+                }
+                Ok(r)
+            });
+            self.record("short", &result);
+            if result.is_ok() {
+                *self.main.borrow_mut() = chain;
+            }
+            result.map(|_| "0xtx".to_string())
+        }
+        fn submit_fork(&self, fork_id: u64, header_hex: &str) -> Result<String> {
+            let mut forks = self.forks.borrow_mut();
+            let mut chain = forks
+                .remove(&fork_id)
+                .unwrap_or_else(|| self.main.borrow().clone());
+            let result = Self::extend(&mut chain, header_hex);
+            self.record("fork", &result);
+            result?;
+            if chain.len() > self.main.borrow().len() {
+                *self.main.borrow_mut() = chain;
+            } else {
+                forks.insert(fork_id, chain);
+            }
+            Ok("0xtx".to_string())
+        }
+        fn stored_header_commitment(&self, stored_header: &[u8]) -> String {
+            stored_header[..80]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+    }
+
+    fn poll(node: &BranchNode, relay: &BranchRelay, batch: u64) -> Result<SyncResult> {
+        let mut loop_state = SyncLoopState::new(0, batch, 0);
+        poll_with(node, relay, &mut loop_state)
+    }
+
+    fn poll_with(
+        node: &BranchNode,
+        relay: &BranchRelay,
+        loop_state: &mut SyncLoopState,
+    ) -> Result<SyncResult> {
+        let state_store = test_state_store();
+        run_poll_cycle(node, relay, SyncTrigger::PollTick, loop_state, &state_store)
+    }
+
+    #[test]
+    fn reorg_follows_node_branch_by_short_fork_or_fork() {
+        let rejected = "main execution reverted: block commitment";
+        // (first replaced height, node tip, expected calls)
+        let cases: [(u64, u64, &[&str]); 3] = [
+            (110, 111, &[rejected, "short 109..111"]),
+            (108, 111, &[rejected, "short 107..111"]),
+            (
+                106,
+                115,
+                &[rejected, "fork 105..109", "fork 109..113", "fork 113..115"],
+            ),
+        ];
+        for (fork_from, node_tip, calls) in cases {
+            let node = BranchNode {
+                tip: Cell::new(node_tip),
+                fork_from,
+            };
+            let relay = BranchRelay::new(110, false);
+
+            let result = poll(&node, &relay, 4);
+            assert!(matches!(result, Ok(SyncResult::Progressed)), "{result:?}");
+            assert_eq!(*relay.calls.borrow(), calls);
+            assert_eq!(relay.relay_tip_height().unwrap(), node_tip);
+            assert_eq!(
+                relay.relay_commit_hash(node_tip).unwrap(),
+                fake_full_header_hex(node_tip + 1000)
+            );
+
+            // Main sync continues on the new branch.
+            node.tip.set(node_tip + 1);
+            relay.calls.borrow_mut().clear();
+            let result = poll(&node, &relay, 4);
+            assert!(matches!(result, Ok(SyncResult::Progressed)), "{result:?}");
+            let main_call = format!("main {}..{}", node_tip, node_tip + 1);
+            assert_eq!(*relay.calls.borrow(), [main_call]);
+        }
+    }
+
+    #[test]
+    fn short_fork_limit_is_independent_of_catchup_batch_size() {
+        // catchup_batch_size alone would fit a 3-block branch in one short-fork call;
+        // a tighter short_fork_limit must still force the multi-call fork path.
+        let node = BranchNode {
+            tip: Cell::new(111),
+            fork_from: 108,
+        };
+        let relay = BranchRelay::new(110, false);
+        let mut loop_state = SyncLoopState::new(0, 16, 0);
+        loop_state.short_fork_limit = 2;
+
+        let result = poll_with(&node, &relay, &mut loop_state);
+        assert!(matches!(result, Ok(SyncResult::Progressed)), "{result:?}");
+        assert_eq!(
+            *relay.calls.borrow(),
+            ["main execution reverted: block commitment", "fork 107..111"]
+        );
+        assert_eq!(relay.relay_tip_height().unwrap(), 111);
+    }
+
+    #[test]
+    fn reorg_relay_cannot_follow_is_reported_once_per_tip() {
+        let rejected = "main execution reverted: block commitment";
+        // Fork point below the checkpoint, and a branch the relay rejects as lighter.
+        let cases: [(u64, bool, &[&str]); 2] = [
+            (100, false, &[rejected]),
+            (
+                110,
+                true,
+                &[
+                    rejected,
+                    "short execution reverted: shortFork: not enough work",
+                ],
+            ),
+        ];
+        for (fork_from, lighter, calls) in cases {
+            let node = BranchNode {
+                tip: Cell::new(111),
+                fork_from,
+            };
+            let relay = BranchRelay::new(110, lighter);
+            let mut loop_state = SyncLoopState::new(0, 4, 0);
+
+            for _ in 0..3 {
+                let result = poll_with(&node, &relay, &mut loop_state);
+                assert!(
+                    matches!(result, Ok(SyncResult::ReorgDetected)),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(*relay.calls.borrow(), calls);
+            assert_eq!(relay.relay_tip_height().unwrap(), 110);
+
+            // A new node tip allows one new attempt.
+            node.tip.set(112);
+            let result = poll_with(&node, &relay, &mut loop_state);
+            assert!(
+                matches!(result, Ok(SyncResult::ReorgDetected)),
+                "{result:?}"
+            );
+            assert_eq!(relay.calls.borrow().len(), calls.len() * 2);
+        }
+    }
+
     fn test_state_store() -> JsonFileStateStore {
+        // Tests run in parallel. The counter keeps each path unique within one millisecond.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut path = env::temp_dir();
         path.push(format!(
-            "btc-relay-sync-engine-state-{}-{}.json",
+            "btc-relay-sync-engine-state-{}-{}-{}.json",
             std::process::id(),
-            current_test_timestamp()
+            current_test_timestamp(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         JsonFileStateStore::new(path)
     }

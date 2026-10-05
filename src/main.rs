@@ -41,6 +41,7 @@ type SyncRunner = fn(
     u64,
     u64,
     u64,
+    u64,
     &JsonFileStateStore,
 ) -> Result<()>;
 
@@ -80,6 +81,7 @@ fn run_app_with(
         cfg.start_height,
         cfg.catchup_batch_size,
         cfg.live_lag_threshold,
+        cfg.short_fork_limit,
         &state_store,
     )?;
 
@@ -109,7 +111,7 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    static CAPTURED_ARGS: OnceLock<Mutex<Option<(u64, u64, u64, u64)>>> = OnceLock::new();
+    static CAPTURED_ARGS: OnceLock<Mutex<Option<(u64, u64, u64, u64, u64)>>> = OnceLock::new();
 
     fn no_op_metrics_start(_cfg: &AppConfig) -> Result<()> {
         Ok(())
@@ -126,6 +128,7 @@ mod tests {
         start_height: u64,
         catchup_batch_size: u64,
         live_lag_threshold: u64,
+        short_fork_limit: u64,
         _state_store: &JsonFileStateStore,
     ) -> Result<()> {
         let slot = CAPTURED_ARGS.get_or_init(|| Mutex::new(None));
@@ -134,6 +137,7 @@ mod tests {
             start_height,
             catchup_batch_size,
             live_lag_threshold,
+            short_fork_limit,
         ));
         Ok(())
     }
@@ -158,6 +162,7 @@ mod tests {
             start_height: 123,
             catchup_batch_size: 16,
             live_lag_threshold: 2,
+            short_fork_limit: 8,
             state_file_path: "artifacts/relay-state.json".to_string(),
             metrics_bind_addr: "127.0.0.1:9090".to_string(),
         }
@@ -182,6 +187,6 @@ mod tests {
             .lock()
             .expect("capture lock")
             .expect("captured args");
-        assert_eq!(captured, (7, 123, 16, 2));
+        assert_eq!(captured, (7, 123, 16, 2, 8));
     }
 }
