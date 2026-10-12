@@ -81,6 +81,17 @@ pub fn run_startup_checks(cfg: &AppConfig) -> Result<()> {
             start_height = cfg.start_height,
             "custom start height configured"
         );
+        // A stored header needs the 10 earlier timestamps for its median-time-past
+        // window (see build_stored_header), so heights 1..=10 can never be submitted:
+        // fail fast here instead of hard-failing every sync cycle forever.
+        if cfg.start_height < 11 {
+            metrics::observe_startup_check("start_height_window", false);
+            anyhow::bail!(
+                "START_HEIGHT {} is below 11: stored headers need 10 earlier timestamps, use 0 (auto-discover) or >= 11",
+                cfg.start_height
+            );
+        }
+        metrics::observe_startup_check("start_height_window", true);
     } else {
         info!("start height is 0; relayer will auto-discover from chain state in later tasks");
     }
@@ -434,6 +445,22 @@ mod tests {
         let mut cfg = test_config();
         cfg.start_height = 12345;
         run_startup_checks(&cfg).expect("nonzero start height should still validate");
+    }
+
+    #[test]
+    fn run_startup_checks_rejects_start_height_below_timestamp_window() {
+        for height in [1, 10] {
+            let mut cfg = test_config();
+            cfg.start_height = height;
+            let err = run_startup_checks(&cfg).expect_err("height in 1..=10 must fail fast");
+            assert!(
+                err.to_string().contains("below 11"),
+                "unexpected error for height {height}: {err:#}"
+            );
+        }
+        let mut cfg = test_config();
+        cfg.start_height = 11;
+        run_startup_checks(&cfg).expect("height 11 has a full timestamp window");
     }
 
     #[test]
