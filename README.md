@@ -21,7 +21,7 @@ Each module has a clear role (see `//!` headers in source). Not full onion archi
 | Module | Responsibility |
 |--------|----------------|
 | `src/main.rs` | Composition root: wire deps, start the loop. |
-| `src/configs.rs` | Env → `AppConfig` + validation. |
+| `src/configs.rs` | Env в†’ `AppConfig` + validation. |
 | `src/startup.rs` | Pre-flight checks (no submissions). |
 | `src/bitcoin_rpc.rs` | Bitcoin Core JSON-RPC client. |
 | `src/evm_relay_contract_client.rs` | EVM BTCRelay contract client (`EvmRelayContractClient`). |
@@ -58,6 +58,30 @@ Each module has a clear role (see `//!` headers in source). Not full onion archi
    - `cp .env.example .env`
 2. Run daemon:
    - `cargo run`
+
+## Priority fee configuration
+
+`EVM_PRIORITY_FEE_WEI` sets the EIP-1559 `maxPriorityFeePerGas` in whole wei per gas.
+The value is an unsigned decimal integer, passed to the transaction without unit conversion.
+It is a per-gas tip cap, not a fixed payment per transaction. Base fees and data-posting fees still apply.
+
+| Value | Equivalent priority fee |
+|-------|-------------------------|
+| `0` | No priority tip |
+| `1` | 1 wei (0.000000001 gwei) |
+| `100000000` | 0.1 gwei |
+| `1000000000` | 1 gwei |
+
+The example configuration explicitly sets `0`. If the variable is omitted, the wallet/provider
+fills the priority fee; omission is different from explicitly setting zero.
+Accepted values range from `0` to `18446744073709551615` (`u64::MAX`).
+Fractional wei, negative values, and values outside that range are rejected at startup.
+
+**Migration:** replace `EVM_PRIORITY_FEE_GWEI` with `EVM_PRIORITY_FEE_WEI` and multiply
+its value by `1000000000`. For example, old `1` becomes `1000000000`, and old `0` stays `0`.
+Startup fails with a migration message if the old variable is present, even if the new one
+is also set. Update the deployment environment and restart the daemon to apply the change.
+`EVM_MAX_FEE_GWEI` continues to use whole gwei.
 
 ## Run In Docker
 

@@ -62,8 +62,8 @@ pub struct EvmRelayContractClient {
     pub evm_tx_timeout_secs: u64,
     /// If set, caps `maxFeePerGas` (gwei). If `None`, ethers/node fills it in.
     pub evm_max_fee_gwei: Option<u64>,
-    /// If set, sets `maxPriorityFeePerGas` (gwei) for EIP-1559.
-    pub evm_priority_fee_gwei: Option<u64>,
+    /// If set, sets `maxPriorityFeePerGas` (whole wei) for EIP-1559.
+    pub evm_priority_fee_wei: Option<u64>,
     /// Warn when estimated txs left at current fee falls below this threshold.
     pub evm_low_balance_txs_left_warn: u64,
     /// Transport boundary: keeps client logic testable without real RPC/provider setup.
@@ -77,8 +77,31 @@ struct SendTxRequest {
     relay_contract_address: String,
     chain_id: u64,
     max_fee_gwei: Option<u64>,
-    priority_fee_gwei: Option<u64>,
+    priority_fee_wei: Option<u64>,
     calldata: Vec<u8>,
+}
+
+impl SendTxRequest {
+    fn into_transaction_request(self) -> Result<Eip1559TransactionRequest> {
+        let to = self
+            .relay_contract_address
+            .parse::<Address>()
+            .context("invalid RELAY_CONTRACT_ADDRESS")?;
+        let mut req = Eip1559TransactionRequest {
+            to: Some(NameOrAddress::Address(to)),
+            data: Some(Bytes::from(self.calldata)),
+            chain_id: Some(self.chain_id.into()),
+            ..Default::default()
+        };
+        if let Some(max_fee) = self.max_fee_gwei {
+            req.max_fee_per_gas =
+                Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
+        }
+        if let Some(priority_fee) = self.priority_fee_wei {
+            req.max_priority_fee_per_gas = Some(EthersU256::from(priority_fee));
+        }
+        Ok(req)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,24 +167,7 @@ impl EvmTransport for HttpEvmTransport {
                 .with_chain_id(request.chain_id);
             let client = SignerMiddleware::new(provider, wallet);
 
-            let to = request
-                .relay_contract_address
-                .parse::<Address>()
-                .context("invalid RELAY_CONTRACT_ADDRESS")?;
-            let mut req = Eip1559TransactionRequest {
-                to: Some(NameOrAddress::Address(to)),
-                data: Some(Bytes::from(request.calldata)),
-                chain_id: Some(request.chain_id.into()),
-                ..Default::default()
-            };
-            if let Some(max_fee) = request.max_fee_gwei {
-                req.max_fee_per_gas =
-                    Some(EthersU256::from(max_fee) * EthersU256::from(1_000_000_000_u64));
-            }
-            if let Some(priority_fee) = request.priority_fee_gwei {
-                req.max_priority_fee_per_gas =
-                    Some(EthersU256::from(priority_fee) * EthersU256::from(1_000_000_000_u64));
-            }
+            let req = request.into_transaction_request()?;
             let tx: TypedTransaction = req.into();
 
             let pending = client
@@ -189,7 +195,7 @@ impl EvmRelayContractClient {
             evm_tx_confirmations: cfg.evm_tx_confirmations,
             evm_tx_timeout_secs: cfg.evm_tx_timeout_secs,
             evm_max_fee_gwei: cfg.evm_max_fee_gwei,
-            evm_priority_fee_gwei: cfg.evm_priority_fee_gwei,
+            evm_priority_fee_wei: cfg.evm_priority_fee_wei,
             evm_low_balance_txs_left_warn: cfg.evm_low_balance_txs_left_warn,
             transport,
         }
@@ -235,7 +241,7 @@ impl EvmRelayContractClient {
             relay_contract_address: self.relay_contract_address.clone(),
             chain_id: self.evm_chain_id,
             max_fee_gwei: self.evm_max_fee_gwei,
-            priority_fee_gwei: self.evm_priority_fee_gwei,
+            priority_fee_wei: self.evm_priority_fee_wei,
             calldata: calldata.to_vec(),
         })?;
 
@@ -653,6 +659,38 @@ mod tests {
     use alloy::primitives::keccak256;
     use std::sync::Mutex;
 
+    #[test]
+    fn transaction_request_preserves_priority_fee_wei() {
+        for priority_fee in [
+            None,
+            Some(0),
+            Some(1),
+            Some(100_000_000),
+            Some(1_000_000_000),
+            Some(u64::MAX),
+        ] {
+            let request = SendTxRequest {
+                rpc_url: "http://127.0.0.1:8545".to_string(),
+                private_key: "unused".to_string(),
+                relay_contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+                chain_id: 42161,
+                max_fee_gwei: Some(30),
+                priority_fee_wei: priority_fee,
+                calldata: vec![1, 2, 3],
+            }
+            .into_transaction_request()
+            .unwrap();
+            assert_eq!(
+                request.max_priority_fee_per_gas,
+                priority_fee.map(EthersU256::from)
+            );
+            assert_eq!(
+                request.max_fee_per_gas,
+                Some(EthersU256::from(30_000_000_000_u64))
+            );
+        }
+    }
+
     struct MockEvmTransport {
         sent: Mutex<Vec<SendTxRequest>>,
         rpc_methods: Mutex<Vec<String>>,
@@ -717,7 +755,7 @@ mod tests {
             evm_tx_confirmations: 1,
             evm_tx_timeout_secs: 10,
             evm_max_fee_gwei: None,
-            evm_priority_fee_gwei: None,
+            evm_priority_fee_wei: None,
             evm_low_balance_txs_left_warn: 50,
             transport,
         }

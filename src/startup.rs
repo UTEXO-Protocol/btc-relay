@@ -298,7 +298,7 @@ mod tests {
             evm_tx_confirmations: 1,
             evm_tx_timeout_secs: 30,
             evm_max_fee_gwei: None,
-            evm_priority_fee_gwei: None,
+            evm_priority_fee_wei: None,
             evm_low_balance_txs_left_warn: 50,
             poll_interval_secs: 5,
             start_height: 0,

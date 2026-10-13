@@ -40,8 +40,8 @@ pub struct AppConfig {
     pub evm_tx_timeout_secs: u64,
     /// Optional EIP-1559 `maxFeePerGas` in gwei; `None` lets the wallet/node guess.
     pub evm_max_fee_gwei: Option<u64>,
-    /// Optional `maxPriorityFeePerGas` in gwei.
-    pub evm_priority_fee_gwei: Option<u64>,
+    /// Optional `maxPriorityFeePerGas` in whole wei; zero explicitly disables the tip.
+    pub evm_priority_fee_wei: Option<u64>,
     #[serde(default = "default_evm_low_balance_txs_left_warn")]
     /// Warn when estimated remaining tx count (at recent fee level) drops below this value.
     pub evm_low_balance_txs_left_warn: u64,
@@ -74,6 +74,16 @@ impl AppConfig {
             .add_source(Environment::default())
             .build()
             .context("failed to build config from environment")?;
+
+        Self::from_environment_config(config)
+    }
+
+    fn from_environment_config(config: Config) -> Result<Self> {
+        if config.get::<config::Value>("evm_priority_fee_gwei").is_ok() {
+            anyhow::bail!(
+                "EVM_PRIORITY_FEE_GWEI is no longer supported; use EVM_PRIORITY_FEE_WEI and multiply the old gwei value by 1000000000 (0 stays 0)"
+            );
+        }
 
         config
             .try_deserialize::<AppConfig>()
@@ -194,6 +204,61 @@ fn is_valid_evm_address(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn config_from_test_env(
+        priority_fee: Option<&str>,
+        legacy_fee: Option<&str>,
+    ) -> Result<AppConfig> {
+        let mut values: std::collections::HashMap<String, String> = include_str!("../.env.example")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        values.remove("EVM_PRIORITY_FEE_WEI");
+        if let Some(value) = priority_fee {
+            values.insert("EVM_PRIORITY_FEE_WEI".to_string(), value.to_string());
+        }
+        if let Some(value) = legacy_fee {
+            values.insert("EVM_PRIORITY_FEE_GWEI".to_string(), value.to_string());
+        }
+        let config = Config::builder()
+            .add_source(Environment::default().source(Some(values)))
+            .build()?;
+        AppConfig::from_environment_config(config)
+    }
+
+    #[test]
+    fn priority_fee_env_accepts_whole_wei_including_fractional_gwei() {
+        for value in [0, 1, 100_000_000, 1_000_000_000, u64::MAX] {
+            let cfg = config_from_test_env(Some(&value.to_string()), None).unwrap();
+            assert_eq!(cfg.evm_priority_fee_wei, Some(value));
+        }
+        assert_eq!(
+            config_from_test_env(None, None)
+                .unwrap()
+                .evm_priority_fee_wei,
+            None
+        );
+    }
+
+    #[test]
+    fn priority_fee_env_rejects_invalid_wei() {
+        for value in ["0.1", "-1", "18446744073709551616", "invalid"] {
+            assert!(
+                config_from_test_env(Some(value), None).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn priority_fee_env_rejects_legacy_gwei_with_migration_message() {
+        for new_fee in [None, Some("100000000")] {
+            let err = config_from_test_env(new_fee, Some("1")).unwrap_err();
+            assert!(err.to_string().contains("EVM_PRIORITY_FEE_WEI"));
+            assert!(err.to_string().contains("1000000000"));
+        }
+    }
+
     fn valid_config() -> AppConfig {
         AppConfig {
             bitcoin_rpc_url: "http://127.0.0.1:8332".to_string(),
@@ -208,7 +273,7 @@ mod tests {
             evm_tx_confirmations: 1,
             evm_tx_timeout_secs: 120,
             evm_max_fee_gwei: None,
-            evm_priority_fee_gwei: None,
+            evm_priority_fee_wei: None,
             evm_low_balance_txs_left_warn: 50,
             poll_interval_secs: 5,
             start_height: 0,
