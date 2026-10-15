@@ -169,8 +169,16 @@ fn run_poll_cycle(
     loop_state.state = SyncEngineState::Active;
 
     // Two truth sources each cycle: Bitcoin tip and relay tip. Everything else derives from this diff.
-    let bitcoin_tip = bitcoin.get_block_count()?;
-    let relay_tip = submitter.relay_tip_height()?;
+    // A transient RPC blip here must not kill the daemon: classify it like
+    // batch submits do and ride out retryable errors to the next poll.
+    let bitcoin_tip = match bitcoin.get_block_count() {
+        Ok(tip) => tip,
+        Err(err) => return tip_discovery_outcome("bitcoin", err),
+    };
+    let relay_tip = match submitter.relay_tip_height() {
+        Ok(tip) => tip,
+        Err(err) => return tip_discovery_outcome("relay", err),
+    };
     // Saturating to avoid underflow if relay ever reports ahead (misconfig/reorg edge).
     let lag = bitcoin_tip.saturating_sub(relay_tip);
     metrics::set_tip_gauges(bitcoin_tip, relay_tip, lag);
@@ -745,6 +753,19 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
+/// Outcome of a failed tip-discovery RPC: a transient blip becomes
+/// `TemporaryFailure` (the loop logs it and polls again) while a hard failure
+/// (bad config, auth, contract mismatch) still propagates and stops the daemon.
+fn tip_discovery_outcome(source: &'static str, err: anyhow::Error) -> Result<SyncResult> {
+    let reason = format!("{:#}", err);
+    if classify_retry_decision(&reason) == RetryDecision::Retryable {
+        warn!(source, reason = %reason, "tip discovery failed transiently; continuing to next poll");
+        metrics::inc_sync_poll_cycle_error();
+        return Ok(SyncResult::TemporaryFailure);
+    }
+    Err(err)
+}
+
 /// Lowercase hex **without** `0x` — matches what `submit_header` / contract side expect for this path.
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1268,6 +1289,99 @@ mod tests {
         )
         .expect("poll cycle");
         assert_eq!(result, SyncResult::UpToDate);
+    }
+
+    #[test]
+    fn run_poll_cycle_survives_transient_tip_discovery_failure() {
+        struct FlakyBitcoin;
+        impl BitcoinRpcClient for FlakyBitcoin {
+            fn get_block_count(&self) -> Result<u64> {
+                anyhow::bail!("bitcoin rpc transport failed: timeout")
+            }
+            fn get_block_hash(&self, _height: u64) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+        }
+        let bitcoin = FlakyBitcoin;
+        struct OkSubmitter;
+        impl BtcRelaySubmitter for OkSubmitter {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(120)
+            }
+            fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+                Ok([0_u8; 32])
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                Ok("0x00".to_string())
+            }
+            fn submit_header(&self, _header_hex: &str) -> Result<String> {
+                Ok("0xtx".to_string())
+            }
+        }
+        let submitter = OkSubmitter;
+        let state_store = test_state_store();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        let result = run_poll_cycle(
+            &bitcoin,
+            &submitter,
+            SyncTrigger::PollTick,
+            &mut loop_state,
+            &state_store,
+        )
+        .expect("transient tip failure must not kill the cycle");
+        assert_eq!(result, SyncResult::TemporaryFailure);
+    }
+
+    #[test]
+    fn run_poll_cycle_still_fails_on_hard_tip_discovery_error() {
+        struct BrokenBitcoin;
+        impl BitcoinRpcClient for BrokenBitcoin {
+            fn get_block_count(&self) -> Result<u64> {
+                anyhow::bail!("getblockcount returned non-u64 result")
+            }
+            fn get_block_hash(&self, _height: u64) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+            fn get_best_block_hash(&self) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+            fn get_block_header_hex(&self, _hash: &str) -> Result<String> {
+                unreachable!("tip discovery must fail first")
+            }
+        }
+        let bitcoin = BrokenBitcoin;
+        struct OkSubmitter;
+        impl BtcRelaySubmitter for OkSubmitter {
+            fn relay_tip_height(&self) -> Result<u64> {
+                Ok(120)
+            }
+            fn relay_chain_work_bytes(&self) -> Result<[u8; 32]> {
+                Ok([0_u8; 32])
+            }
+            fn relay_commit_hash(&self, _height: u64) -> Result<String> {
+                Ok("0x00".to_string())
+            }
+            fn submit_header(&self, _header_hex: &str) -> Result<String> {
+                Ok("0xtx".to_string())
+            }
+        }
+        let submitter = OkSubmitter;
+        let state_store = test_state_store();
+        let mut loop_state = SyncLoopState::new(0, 16, 2);
+        run_poll_cycle(
+            &bitcoin,
+            &submitter,
+            SyncTrigger::PollTick,
+            &mut loop_state,
+            &state_store,
+        )
+        .expect_err("hard tip failure must still propagate");
     }
 
     #[test]
