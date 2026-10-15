@@ -756,8 +756,14 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 /// Maps error text to retry vs fatal; keep markers aligned with real RPC failure strings you see in production.
+/// The text carries block heights and hashes from error context, so markers must not be bare numbers:
+/// `"429"` once matched height 156429 and turned a contract revert into an endless retry.
 fn classify_retry_decision(err_message: &str) -> RetryDecision {
     let msg = err_message.to_ascii_lowercase();
+    // A revert is deterministic: the same payload reverts again. It must reach the reorg path.
+    if msg.contains("execution reverted") || msg.contains("transaction reverted") {
+        return RetryDecision::HardFailure;
+    }
     let retryable_markers = [
         "timeout",
         "timed out",
@@ -765,8 +771,10 @@ fn classify_retry_decision(err_message: &str) -> RetryDecision {
         "connection reset",
         "connection refused",
         "transport failed",
-        "429",
-        "503",
+        "too many requests",
+        "service unavailable",
+        "code: 429",
+        "\"code\":429",
         "network",
         "broken pipe",
     ];
@@ -1051,6 +1059,52 @@ mod tests {
             classify_retry_decision("failed to decode abi output"),
             RetryDecision::HardFailure
         );
+    }
+
+    #[test]
+    fn retry_classification_treats_revert_as_hard_failure_whatever_the_height() {        
+        let revert =
+            "failed submit_header for range 156429..156436: failed to send header submission \
+            transaction: eth_sendRawTransaction failed: (code: 3, message: execution reverted: \
+            submitMain: block commitment, data: Some(String(\"0x08c379a0\")))";
+        assert_eq!(classify_retry_decision(revert), RetryDecision::HardFailure);
+        // The revert reason is contract text and may contain any retry marker.
+        assert_eq!(
+            classify_retry_decision("execution reverted: Pausable: network paused"),
+            RetryDecision::HardFailure
+        );
+        assert_eq!(
+            classify_retry_decision(
+                "header submission transaction failed confirmation step: \
+                 transaction reverted on-chain: 0x429503"
+            ),
+            RetryDecision::HardFailure
+        );
+        // Other failures that carry such heights are not rate limits either.
+        assert_eq!(
+            classify_retry_decision("getblockhash returned empty hash for height 156429"),
+            RetryDecision::HardFailure
+        );
+        assert_eq!(
+            classify_retry_decision("getblockhash returned empty hash for height 503"),
+            RetryDecision::HardFailure
+        );
+    }
+
+    #[test]
+    fn retry_classification_still_retries_rate_limits_and_unavailable_rpc() {
+        for message in [
+            "bitcoin rpc http status 429 Too Many Requests for method getblockhash: null",
+            "bitcoin rpc http status 503 Service Unavailable for method getblockcount: null",
+            "eth_call returned error: {\"code\":429,\"message\":\"exceeded compute units\"}",
+            "eth_sendRawTransaction failed: (code: 429, message: rate limited, data: None)",
+        ] {
+            assert_eq!(
+                classify_retry_decision(message),
+                RetryDecision::Retryable,
+                "{message}"
+            );
+        }
     }
 
     #[test]
