@@ -343,7 +343,14 @@ impl EvmRelayContractClient {
                 parse_hex_quantity_u64(head.as_str()).context("invalid eth_blockNumber format")?;
 
             // Inclusive depth: same block as head => 1 confirmation; one block later => 2; etc.
-            let confirmations = head_num.saturating_sub(tx_block_num) + 1;
+            // A head below the receipt block means the tx's block was reorged out
+            // from under us: count 0 and keep polling (the next receipt fetch will
+            // show it pending again) instead of reporting a phantom confirmation
+            // that the sync loop would persist as a checkpoint and advance past.
+            let confirmations = head_num
+                .checked_sub(tx_block_num)
+                .and_then(|depth| depth.checked_add(1))
+                .unwrap_or(0);
             if confirmations >= self.evm_tx_confirmations {
                 let tx_fee_wei = match (
                     receipt.gas_used.as_deref(),
@@ -1110,6 +1117,27 @@ mod tests {
             )
             .expect_err("zero confirmations should fail");
         assert!(err.to_string().contains("EVM_TX_CONFIRMATIONS must be > 0"));
+    }
+
+    #[test]
+    fn wait_for_confirmation_waits_when_head_reorgs_below_receipt_block() {
+        // Receipt says block 0x10 but the head moved back to 0x0f: the tx's block
+        // was reorged out. Must keep polling (here: hit the timeout), never report
+        // a phantom confirmation the sync loop would checkpoint and advance past.
+        let mock = Arc::new(MockEvmTransport::new());
+        *mock.receipt_block.lock().expect("receipt block lock") = "0x10".to_string();
+        *mock.head_block.lock().expect("head block lock") = "0x0f".to_string();
+        let mut submitter = test_relay_client_with_transport(mock);
+        submitter.evm_tx_confirmations = 1;
+        submitter.evm_tx_timeout_secs = 1;
+        let err = submitter
+            .wait_for_confirmation(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect_err("reorged-below-head must not confirm");
+        assert!(err
+            .to_string()
+            .contains("timed out waiting for tx confirmation"));
     }
 
     #[test]
